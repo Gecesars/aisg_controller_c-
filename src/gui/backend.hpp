@@ -9,7 +9,7 @@
 
 namespace atc::gui {
 
-enum class DeviceKind { Ret, Tma, Sensor, Unknown };
+enum class DeviceKind { Ret, Tma, Adb, Sensor, Unknown };
 enum class DeviceState { Offline, Discovered, Operational, Busy, Alarm, Fault };
 
 struct DeviceRecord {
@@ -23,6 +23,7 @@ struct DeviceRecord {
     std::string hardwareVersion;
     std::string softwareVersion;
     std::string aisgVersion{"2.0"};
+    bool aisg3{};
     std::string antennaModel;
     std::string baseStation;
     std::string sector;

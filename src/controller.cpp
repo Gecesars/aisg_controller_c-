@@ -1,11 +1,28 @@
 #include "atc/controller.hpp"
 
+#include "atc/adb.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <utility>
 
 namespace atc {
+
+namespace {
+
+std::string hex16(const std::uint16_t value) {
+    constexpr char digits[] = "0123456789ABCDEF";
+    std::string result(4, '0');
+    result[0] = digits[(value >> 12U) & 0x0FU];
+    result[1] = digits[(value >> 8U) & 0x0FU];
+    result[2] = digits[(value >> 4U) & 0x0FU];
+    result[3] = digits[value & 0x0FU];
+    return result;
+}
+
+} // namespace
 
 struct ControllerService::Work {
     OperationId id{};
@@ -73,8 +90,13 @@ OperationId ControllerService::scan(const ScanOptions options) {
         if (!isConnected()) {
             throw std::runtime_error("cannot scan while disconnected");
         }
-        if (options.firstAddress == 0 || options.firstAddress > options.lastAddress) {
+        if (options.firstAddress == 0 || options.lastAddress == aisg3::allStationsAddress ||
+            options.firstAddress > options.lastAddress) {
             throw std::invalid_argument("invalid AISG scan address range");
+        }
+        if (options.protocol == ProtocolProfile::aisg3) {
+            scanAisg3(operation, options, cancelled);
+            return;
         }
 
         {
@@ -157,11 +179,395 @@ OperationId ControllerService::scan(const ScanOptions options) {
     });
 }
 
+void ControllerService::scanAisg3(
+    const OperationId operation,
+    const ScanOptions& options,
+    const std::shared_ptr<std::atomic_bool>& cancelled) {
+    using namespace std::chrono_literals;
+
+    if (options.primaryId == 0) {
+        throw std::invalid_argument("AISG v3 PrimaryID must be non-zero");
+    }
+    {
+        std::scoped_lock lock(stateMutex_);
+        devices_.clear();
+        sequences_.clear();
+        aisg3Sequence_ = 0;
+    }
+    emit({EventKind::devicesCleared, operation, std::chrono::system_clock::now(),
+          std::nullopt, std::nullopt, 0, "Starting AISG v3 XID device scan", {}});
+
+    struct XidExchange {
+        bool activity{};
+        bool invalid{};
+        std::vector<hdlc::Frame> frames;
+    };
+    const auto exchangeXid = [&](const hdlc::Frame& request,
+                                 const std::chrono::milliseconds timeout) {
+        XidExchange result;
+        decoder_.reset();
+        const auto encoded = hdlc::encode(request);
+        logFrame(EventKind::txFrame, operation, encoded);
+        transport_->write(encoded);
+
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        bool rawActivity = false;
+        bool sawEcho = false;
+        while (std::chrono::steady_clock::now() < deadline && !cancelled->load()) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            const auto slice = std::min(std::max(remaining, 1ms), 25ms);
+            const auto received = transport_->read(slice);
+            if (received.empty()) {
+                if (rawActivity) {
+                    break;
+                }
+                continue;
+            }
+            rawActivity = true;
+            logFrame(EventKind::rxFrame, operation, received);
+            for (auto& decoded : decoder_.push(received)) {
+                if (!decoded.frame) {
+                    result.invalid = true;
+                    continue;
+                }
+                if (*decoded.frame == request) {
+                    sawEcho = true;
+                    continue;
+                }
+                result.activity = true;
+                result.frames.push_back(std::move(*decoded.frame));
+            }
+        }
+        if (rawActivity && !sawEcho && result.frames.empty()) {
+            result.activity = true;
+        }
+        if (result.invalid) {
+            result.activity = true;
+        }
+        decoder_.reset();
+        // AISG Base 11.8: after a Final response the primary must leave at
+        // least 3 ms before starting its next transmission.
+        if (!result.frames.empty()) {
+            std::this_thread::sleep_for(3ms);
+        }
+        return result;
+    };
+
+    enum class QueryKind { none, found, collision };
+    struct QueryResult {
+        QueryKind kind{QueryKind::none};
+        std::optional<aisg3::DeviceScanResponse> device;
+    };
+    std::size_t queryCount{};
+    const auto query = [&](const aisg3::DeviceScanPattern& pattern) {
+        if (++queryCount > 512) {
+            throw std::runtime_error("AISG v3 XID collision resolution exceeded 512 queries");
+        }
+        const auto request = aisg3::makeDeviceScanCommand(pattern);
+        const auto exchange = exchangeXid(request, std::max(options.responseTimeout, 250ms));
+        std::vector<aisg3::DeviceScanResponse> devices;
+        for (const auto& frame : exchange.frames) {
+            if (const auto parsed = aisg3::parseDeviceScanResponse(frame)) {
+                devices.push_back(*parsed);
+            }
+        }
+        if (!exchange.invalid && exchange.frames.size() == 1 && devices.size() == 1) {
+            return QueryResult{QueryKind::found, std::move(devices.front())};
+        }
+        return QueryResult{exchange.activity ? QueryKind::collision : QueryKind::none,
+                           std::nullopt};
+    };
+
+    using PatternBytes = std::array<std::uint8_t, 21>;
+    const auto makePattern = [](const PatternBytes& value, const PatternBytes& mask) {
+        aisg3::DeviceScanPattern pattern;
+        pattern.uniqueId.assign(value.begin(), value.begin() + 19);
+        pattern.uniqueIdMask.assign(mask.begin(), mask.begin() + 19);
+        pattern.portNumber.assign(value.begin() + 19, value.end());
+        pattern.portNumberMask.assign(mask.begin() + 19, mask.end());
+        return pattern;
+    };
+
+    std::function<std::optional<aisg3::DeviceScanResponse>(PatternBytes, PatternBytes, std::size_t)>
+        resolveCollision;
+    resolveCollision = [&](PatternBytes value, PatternBytes mask, const std::size_t firstBit)
+        -> std::optional<aisg3::DeviceScanResponse> {
+        for (std::size_t bit = firstBit; bit < value.size() * 8; ++bit) {
+            const auto octet = bit / 8;
+            const auto bitMask = static_cast<std::uint8_t>(1U << (7U - (bit % 8U)));
+
+            auto zeroValue = value;
+            auto zeroMask = mask;
+            zeroMask[octet] |= bitMask;
+            zeroValue[octet] &= static_cast<std::uint8_t>(~bitMask);
+            const auto zero = query(makePattern(zeroValue, zeroMask));
+            if (zero.kind == QueryKind::found) {
+                return zero.device;
+            }
+            if (zero.kind == QueryKind::collision) {
+                if (auto resolved = resolveCollision(zeroValue, zeroMask, bit + 1)) {
+                    return resolved;
+                }
+            }
+
+            auto oneValue = value;
+            auto oneMask = mask;
+            oneMask[octet] |= bitMask;
+            oneValue[octet] |= bitMask;
+            const auto one = query(makePattern(oneValue, oneMask));
+            if (one.kind == QueryKind::found) {
+                return one.device;
+            }
+            if (one.kind == QueryKind::collision) {
+                if (auto resolved = resolveCollision(oneValue, oneMask, bit + 1)) {
+                    return resolved;
+                }
+            }
+        }
+        return std::nullopt;
+    };
+
+    auto nextAddress = options.firstAddress;
+    while (!cancelled->load() && nextAddress <= options.lastAddress) {
+        queryCount = 0;
+        const auto broad = query({});
+        if (broad.kind == QueryKind::none) {
+            break;
+        }
+        auto candidate = broad.device;
+        if (broad.kind == QueryKind::collision) {
+            candidate = resolveCollision({}, {}, 0);
+        }
+        if (!candidate) {
+            throw std::runtime_error("AISG v3 XID collision could not be resolved");
+        }
+
+        PatternBytes exactValue{};
+        PatternBytes exactMask{};
+        std::copy(candidate->uniqueId.begin(), candidate->uniqueId.end(), exactValue.begin());
+        exactValue[19] = static_cast<std::uint8_t>((candidate->portNumber >> 8U) & 0xFFU);
+        exactValue[20] = static_cast<std::uint8_t>(candidate->portNumber & 0xFFU);
+        exactMask.fill(0xFF);
+        const auto confirmation = query(makePattern(exactValue, exactMask));
+        if (confirmation.kind != QueryKind::found || !confirmation.device ||
+            confirmation.device->uniqueId != candidate->uniqueId ||
+            confirmation.device->portNumber != candidate->portNumber) {
+            throw std::runtime_error("AISG v3 XID identity confirmation failed");
+        }
+        candidate = confirmation.device;
+
+        if (std::find(candidate->baseVersions.begin(), candidate->baseVersions.end(),
+                      aisg3::supportedBaseVersion) == candidate->baseVersions.end()) {
+            throw std::runtime_error("ALD does not advertise AISG Base version 3.0.8");
+        }
+
+        aisg3::AddressAssignment assignment;
+        assignment.address = nextAddress;
+        assignment.primaryId = options.primaryId;
+        assignment.uniqueId = candidate->uniqueId;
+        assignment.aldType = candidate->aldType;
+        assignment.vendorCode = candidate->vendorCode;
+        assignment.portNumber = candidate->portNumber;
+        const auto assignmentFrame = aisg3::makeAddressAssignmentCommand(assignment);
+        const auto assignmentExchange = exchangeXid(assignmentFrame, 500ms);
+        std::optional<aisg3::AddressAssignmentResponse> assignmentResponse;
+        for (const auto& frame : assignmentExchange.frames) {
+            if (const auto parsed = aisg3::parseAddressAssignmentResponse(frame);
+                parsed && parsed->address == nextAddress && parsed->uniqueId == candidate->uniqueId &&
+                parsed->portNumber == candidate->portNumber) {
+                if (assignmentResponse) {
+                    throw std::runtime_error("multiple ALDs accepted one AISG v3 address assignment");
+                }
+                assignmentResponse = parsed;
+            }
+        }
+        if (!assignmentResponse) {
+            throw std::runtime_error("AISG v3 address assignment was not acknowledged");
+        }
+
+        const auto ua = transact(operation, aisg::makeSnrm(nextAddress), 250ms, cancelled);
+        if (!ua || ua->control != 0x73) {
+            throw std::runtime_error("AISG v3 ALD did not establish the HDLC link with UA");
+        }
+        std::this_thread::sleep_for(3ms);
+
+        Device found;
+        found.address = nextAddress;
+        found.protocol = ProtocolProfile::aisg3;
+        found.status = DeviceStatus::initializing;
+        found.uid = aisg3::uniqueIdString(candidate->uniqueId);
+        found.vendor.assign(candidate->vendorCode.begin(), candidate->vendorCode.end());
+
+        const auto informationCommand = aisg3::makeGetInformation(nextAisg3Sequence());
+        const auto informationResponse = transactAisg3(
+            operation, nextAddress, informationCommand, 1200ms, cancelled);
+        const auto information = informationResponse
+                                     ? aisg3::parseInformation(*informationResponse)
+                                     : std::nullopt;
+        if (!information) {
+            throw std::runtime_error("AISG v3 GetInformation failed or returned malformed data");
+        }
+        found.product = information->productNumber;
+        found.serialNumber = information->serialNumber;
+        found.hardwareVersion = information->hardwareVersion;
+        found.softwareVersion = information->softwareVersion;
+
+        const auto subunitCommand = aisg3::makeGetSubunitList(nextAisg3Sequence());
+        const auto subunitResponse = transactAisg3(
+            operation, nextAddress, subunitCommand, 1200ms, cancelled);
+        const auto subunits = subunitResponse ? aisg3::parseSubunitList(*subunitResponse)
+                                              : std::nullopt;
+        if (!subunits) {
+            throw std::runtime_error("AISG v3 GetSubunitList failed or returned malformed data");
+        }
+        std::optional<std::uint16_t> adbSubunit;
+        for (const auto& subunit : *subunits) {
+            DeviceKind kind = DeviceKind::unknown;
+            switch (subunit.type) {
+            case aisg3::SubunitType::ret: kind = DeviceKind::ret; break;
+            case aisg3::SubunitType::tma: kind = DeviceKind::tma; break;
+            case aisg3::SubunitType::adb:
+                kind = DeviceKind::adb;
+                if (!adbSubunit) {
+                    adbSubunit = subunit.number;
+                }
+                break;
+            case aisg3::SubunitType::als: kind = DeviceKind::unknown; break;
+            }
+            found.subunits.push_back({subunit.number, kind});
+        }
+        const auto hasKind = [&](const DeviceKind kind) {
+            return std::any_of(found.subunits.begin(), found.subunits.end(),
+                               [&](const auto& subunit) { return subunit.kind == kind; });
+        };
+        found.kind = hasKind(DeviceKind::ret) ? DeviceKind::ret
+                    : hasKind(DeviceKind::tma) ? DeviceKind::tma
+                    : hasKind(DeviceKind::adb) ? DeviceKind::adb
+                                               : DeviceKind::unknown;
+
+        if (adbSubunit) {
+            const auto versionsCommand = aisg3::makeGetSubunitVersions(
+                nextAisg3Sequence(), aisg3::SubunitType::adb);
+            const auto versionsResponse = transactAisg3(
+                operation, nextAddress, versionsCommand, 1200ms, cancelled);
+            const auto versions = versionsResponse
+                                      ? aisg3::parseSubunitVersions(*versionsResponse)
+                                      : std::nullopt;
+            if (!versions ||
+                std::find(versions->supported.begin(), versions->supported.end(),
+                          aisg3::supportedAdbVersion) == versions->supported.end()) {
+                throw std::runtime_error("ADB subunit does not advertise version 3.1.7");
+            }
+            const auto setVersionCommand = aisg3::makeSetSubunitVersion(
+                nextAisg3Sequence(), aisg3::SubunitType::adb, aisg3::supportedAdbVersion);
+            const auto setVersionResponse = transactAisg3(
+                operation, nextAddress, setVersionCommand, 1200ms, cancelled);
+            if (!setVersionResponse || !setVersionResponse->success()) {
+                throw std::runtime_error("ADB 3.1.7 version negotiation was rejected");
+            }
+
+            const auto antennaCommand = aisg3::adb::makeGetAntennaInfo(
+                nextAisg3Sequence(), *adbSubunit);
+            const auto antennaResponse = transactAisg3(
+                operation, nextAddress, antennaCommand, 1200ms, cancelled);
+            const auto antenna = antennaResponse
+                                     ? aisg3::adb::parseAntennaInfo(*antennaResponse)
+                                     : std::nullopt;
+            if (!antenna) {
+                throw std::runtime_error("ADB GetAntennaInfo returned malformed data");
+            }
+            found.installation.antennaModel = antenna->modelNumber.value;
+            found.installation.antennaSerial = antenna->serialNumber.value;
+
+            const auto installationCommand = aisg3::adb::makeGetInstallationInfo(
+                nextAisg3Sequence(), *adbSubunit);
+            const auto installationResponse = transactAisg3(
+                operation, nextAddress, installationCommand, 1200ms, cancelled);
+            if (installationResponse && installationResponse->success()) {
+                if (const auto installation =
+                        aisg3::adb::parseInstallationInfo(*installationResponse)) {
+                    found.installation.sectorId = installation->sectorId.value;
+                    found.installation.location = installation->installationNotes.value;
+                    found.installation.bearingDegrees =
+                        static_cast<double>(installation->mechanicalAzimuthDeciDegrees) / 10.0;
+                    found.installation.mechanicalTiltDegrees =
+                        static_cast<double>(installation->mechanicalTiltDeciDegrees) / 10.0;
+                }
+            }
+        }
+
+        found.status = DeviceStatus::ready;
+        storeDevice(std::move(found), operation, true);
+        const auto completed = static_cast<unsigned int>(nextAddress - options.firstAddress) + 1U;
+        const auto total = static_cast<unsigned int>(options.lastAddress - options.firstAddress) + 1U;
+        emit({EventKind::scanProgress, operation, std::chrono::system_clock::now(),
+              nextAddress, std::nullopt, static_cast<int>((completed * 100U) / total),
+              "AISG v3 ALD assigned and negotiated", {}});
+        ++nextAddress;
+    }
+
+    if (nextAddress > options.lastAddress) {
+        emit({EventKind::log, operation, std::chrono::system_clock::now(), std::nullopt,
+              std::nullopt, 100, "AISG v3 address pool exhausted", {}});
+    }
+}
+
 OperationId ControllerService::refresh(const std::uint8_t address) {
     return enqueue("Refresh device", [this, address](
                                               const OperationId operation,
                                               const std::shared_ptr<std::atomic_bool>& cancelled) {
         auto current = requireDevice(address);
+        if (current.protocol == ProtocolProfile::aisg3) {
+            const auto informationCommand = aisg3::makeGetInformation(nextAisg3Sequence());
+            const auto informationResponse = transactAisg3(
+                operation, address, informationCommand, std::chrono::milliseconds(1200), cancelled);
+            const auto information = informationResponse
+                                         ? aisg3::parseInformation(*informationResponse)
+                                         : std::nullopt;
+            if (!information) {
+                throw std::runtime_error("AISG v3 GetInformation failed");
+            }
+            current.product = information->productNumber;
+            current.serialNumber = information->serialNumber;
+            current.hardwareVersion = information->hardwareVersion;
+            current.softwareVersion = information->softwareVersion;
+
+            const auto adbSubunit = std::find_if(
+                current.subunits.begin(), current.subunits.end(),
+                [](const auto& subunit) { return subunit.kind == DeviceKind::adb; });
+            if (adbSubunit != current.subunits.end()) {
+                const auto antennaCommand = aisg3::adb::makeGetAntennaInfo(
+                    nextAisg3Sequence(), adbSubunit->number);
+                const auto antennaResponse = transactAisg3(
+                    operation, address, antennaCommand, std::chrono::milliseconds(1200), cancelled);
+                if (antennaResponse) {
+                    if (const auto antenna = aisg3::adb::parseAntennaInfo(*antennaResponse)) {
+                        current.installation.antennaModel = antenna->modelNumber.value;
+                        current.installation.antennaSerial = antenna->serialNumber.value;
+                    }
+                }
+                const auto installationCommand = aisg3::adb::makeGetInstallationInfo(
+                    nextAisg3Sequence(), adbSubunit->number);
+                const auto installationResponse = transactAisg3(
+                    operation, address, installationCommand,
+                    std::chrono::milliseconds(1200), cancelled);
+                if (installationResponse) {
+                    if (const auto installation =
+                            aisg3::adb::parseInstallationInfo(*installationResponse)) {
+                        current.installation.sectorId = installation->sectorId.value;
+                        current.installation.location = installation->installationNotes.value;
+                        current.installation.bearingDegrees =
+                            static_cast<double>(installation->mechanicalAzimuthDeciDegrees) / 10.0;
+                        current.installation.mechanicalTiltDegrees =
+                            static_cast<double>(installation->mechanicalTiltDeciDegrees) / 10.0;
+                    }
+                }
+            }
+            current.status = current.alarms.empty() ? DeviceStatus::ready : DeviceStatus::alarm;
+            storeDevice(std::move(current), operation);
+            return;
+        }
         const auto timeout = std::chrono::milliseconds(250);
         const auto initialRequest = aisg::makeInitialDataRequest(address, nextControl(address));
         const auto initialResponse = transact(operation, initialRequest, timeout, cancelled);
@@ -197,6 +603,10 @@ OperationId ControllerService::moveRet(const std::uint8_t address, const double 
                                          const OperationId operation,
                                          const std::shared_ptr<std::atomic_bool>& cancelled) {
         auto current = requireDevice(address);
+        if (current.protocol == ProtocolProfile::aisg3) {
+            throw std::runtime_error(
+                "RET AISG v3 write is blocked until the AISG-ST-RET profile is implemented");
+        }
         auto* ret = current.ret();
         if (!ret) {
             throw std::invalid_argument("selected device is not a RET");
@@ -226,6 +636,34 @@ OperationId ControllerService::refreshAlarms(const std::uint8_t address) {
                                           const OperationId operation,
                                           const std::shared_ptr<std::atomic_bool>& cancelled) {
         auto current = requireDevice(address);
+        if (current.protocol == ProtocolProfile::aisg3) {
+            current.alarms.clear();
+            const auto readAlarms = [&](const std::uint16_t subunit) {
+                const auto command = aisg3::makeGetAlarmStatus(nextAisg3Sequence(), subunit);
+                const auto response = transactAisg3(
+                    operation, address, command, std::chrono::milliseconds(1200), cancelled);
+                const auto alarms = response ? aisg3::parseAlarmStatus(*response) : std::nullopt;
+                if (!alarms) {
+                    throw std::runtime_error("AISG v3 GetAlarmStatus failed");
+                }
+                for (const auto& alarm : *alarms) {
+                    const auto severity = alarm.severity >= 3 ? AlarmSeverity::critical
+                                           : alarm.severity == 0 ? AlarmSeverity::information
+                                                                 : AlarmSeverity::warning;
+                    current.alarms.push_back(
+                        {alarm.code, severity,
+                         "AISG v3 alarm 0x" + hex16(alarm.code),
+                         true, std::chrono::system_clock::now()});
+                }
+            };
+            readAlarms(0);
+            for (const auto& subunit : current.subunits) {
+                readAlarms(subunit.number);
+            }
+            current.status = current.alarms.empty() ? DeviceStatus::ready : DeviceStatus::alarm;
+            storeDevice(std::move(current), operation);
+            return;
+        }
         const auto request = aisg::makeGetAlarmsRequest(address, nextControl(address));
         const auto response = transact(operation, request, std::chrono::milliseconds(500), cancelled);
         if (!response) {
@@ -246,6 +684,24 @@ OperationId ControllerService::clearAlarms(const std::uint8_t address) {
                                             const OperationId operation,
                                             const std::shared_ptr<std::atomic_bool>& cancelled) {
         auto current = requireDevice(address);
+        if (current.protocol == ProtocolProfile::aisg3) {
+            const auto clear = [&](const std::uint16_t subunit) {
+                const auto command = aisg3::makeClearActiveAlarms(nextAisg3Sequence(), subunit);
+                const auto response = transactAisg3(
+                    operation, address, command, std::chrono::milliseconds(1200), cancelled);
+                if (!response || !response->success()) {
+                    throw std::runtime_error("AISG v3 ClearActiveAlarms was rejected");
+                }
+            };
+            clear(0);
+            for (const auto& subunit : current.subunits) {
+                clear(subunit.number);
+            }
+            current.alarms.clear();
+            current.status = DeviceStatus::ready;
+            storeDevice(std::move(current), operation);
+            return;
+        }
         const auto request = aisg::makeClearAlarmsRequest(address, nextControl(address));
         const auto response = transact(operation, request, std::chrono::milliseconds(500), cancelled);
         if (!response) {
@@ -266,6 +722,10 @@ OperationId ControllerService::runSelfTest(const std::uint8_t address) {
                                         const OperationId operation,
                                         const std::shared_ptr<std::atomic_bool>& cancelled) {
         auto current = requireDevice(address);
+        if (current.protocol == ProtocolProfile::aisg3) {
+            throw std::runtime_error(
+                "AISG v3 self-test requires the applicable subunit type standard");
+        }
         const auto request = aisg::makeSelfTestRequest(address, nextControl(address));
         const auto response = transact(operation, request, std::chrono::milliseconds(1000), cancelled);
         if (!response) {
@@ -285,6 +745,10 @@ OperationId ControllerService::calibrate(const std::uint8_t address) {
                                         const OperationId operation,
                                         const std::shared_ptr<std::atomic_bool>& cancelled) {
         auto current = requireDevice(address);
+        if (current.protocol == ProtocolProfile::aisg3) {
+            throw std::runtime_error(
+                "RET AISG v3 calibration is blocked until AISG-ST-RET is implemented");
+        }
         auto* ret = current.ret();
         if (!ret) {
             throw std::invalid_argument("selected device is not a RET");
@@ -309,6 +773,10 @@ OperationId ControllerService::setTmaGain(const std::uint8_t address, const doub
                                           const OperationId operation,
                                           const std::shared_ptr<std::atomic_bool>& cancelled) {
         auto current = requireDevice(address);
+        if (current.protocol == ProtocolProfile::aisg3) {
+            throw std::runtime_error(
+                "TMA AISG v3 write is blocked until AISG-ST-TMA is implemented");
+        }
         auto* tma = current.tma();
         if (!tma) {
             throw std::invalid_argument("selected device is not a TMA");
@@ -337,6 +805,10 @@ OperationId ControllerService::setTmaMode(const std::uint8_t address, const TmaM
                                           const OperationId operation,
                                           const std::shared_ptr<std::atomic_bool>& cancelled) {
         auto current = requireDevice(address);
+        if (current.protocol == ProtocolProfile::aisg3) {
+            throw std::runtime_error(
+                "TMA AISG v3 write is blocked until AISG-ST-TMA is implemented");
+        }
         auto* tma = current.tma();
         if (!tma) {
             throw std::invalid_argument("selected device is not a TMA");
@@ -363,6 +835,10 @@ OperationId ControllerService::setDeviceField(const std::uint8_t address,
                                                const OperationId operation,
                                                const std::shared_ptr<std::atomic_bool>& cancelled) {
         auto current = requireDevice(address);
+        if (current.protocol == ProtocolProfile::aisg3) {
+            throw std::runtime_error(
+                "legacy SetDeviceData is not valid for AISG v3; ADB writes remain blocked in the GUI");
+        }
         const auto request = aisg::makeSetDataRequest(address, nextControl(address), field, value);
         const auto response = transact(operation, request, std::chrono::milliseconds(500), cancelled);
         if (!response) {
@@ -535,6 +1011,54 @@ std::optional<hdlc::Frame> ControllerService::transact(
     return std::nullopt;
 }
 
+std::optional<aisg3::Response> ControllerService::transactAisg3(
+    const OperationId operation,
+    const std::uint8_t address,
+    const aisg3::PrimaryCommand& command,
+    const std::chrono::milliseconds timeout,
+    const std::shared_ptr<std::atomic_bool>& cancelled) {
+    if (!transport_->isOpen()) {
+        throw TransportError("transport is closed");
+    }
+    const auto request = aisg3::makeCommandFrame(address, nextControl(address), command);
+    const auto encoded = hdlc::encode(request);
+    logFrame(EventKind::txFrame, operation, encoded);
+    transport_->write(encoded);
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline && !cancelled->load()) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        const auto received = transport_->read(std::max(remaining, std::chrono::milliseconds(1)));
+        if (received.empty()) {
+            continue;
+        }
+        logFrame(EventKind::rxFrame, operation, received);
+        for (auto& decoded : decoder_.push(received)) {
+            if (!decoded.frame) {
+                emit({EventKind::log, operation, std::chrono::system_clock::now(),
+                      std::nullopt, std::nullopt, -1,
+                      "Discarded AISG v3 HDLC frame: " + decoded.message, {}});
+                continue;
+            }
+            if (decoded.frame->address == request.address &&
+                decoded.frame->control == static_cast<std::uint8_t>(request.control + 0x20U)) {
+                if (auto response = aisg3::parseResponse(
+                        *decoded.frame, command.command, command.sequence)) {
+                    // The ALD I-frame carries F=1. Keep the normative minimum
+                    // turnaround before any following poll/command.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                    return response;
+                }
+            }
+            emit({EventKind::log, operation, std::chrono::system_clock::now(),
+                  decoded.frame->address, std::nullopt, -1,
+                  "Received an unrelated, unsolicited or malformed AISG v3 frame", {}});
+        }
+    }
+    return std::nullopt;
+}
+
 Device ControllerService::requireDevice(const std::uint8_t address) const {
     if (!isConnected()) {
         throw std::runtime_error("controller is disconnected");
@@ -564,6 +1088,11 @@ void ControllerService::storeDevice(Device device,
 std::uint8_t ControllerService::nextControl(const std::uint8_t address) {
     std::scoped_lock lock(stateMutex_);
     return sequences_[address].nextRequest();
+}
+
+std::uint16_t ControllerService::nextAisg3Sequence() noexcept {
+    aisg3Sequence_ = static_cast<std::uint16_t>(aisg3Sequence_ + 1U);
+    return aisg3Sequence_;
 }
 
 const char* toString(const EventKind value) noexcept {

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -23,6 +24,7 @@ DeviceKind mapKind(const atc::DeviceKind kind) {
     switch (kind) {
     case atc::DeviceKind::ret: return DeviceKind::Ret;
     case atc::DeviceKind::tma: return DeviceKind::Tma;
+    case atc::DeviceKind::adb: return DeviceKind::Adb;
     case atc::DeviceKind::unknown: return DeviceKind::Unknown;
     }
     return DeviceKind::Unknown;
@@ -42,6 +44,17 @@ DeviceState mapState(const atc::DeviceStatus state) {
 }
 
 hdlc::Bytes bytes(std::string_view value) { return {value.begin(), value.end()}; }
+
+std::uint32_t stablePrimaryId() {
+    std::ifstream machineId("/etc/machine-id");
+    std::string identity;
+    machineId >> identity;
+    if (identity.empty()) {
+        identity = "antenna-tilt-controller";
+    }
+
+    return atc::aisg3::primaryIdForNodeName(identity);
+}
 
 class CoreBackend final : public Backend {
 public:
@@ -67,14 +80,17 @@ public:
 
         atc::TransportConfig config;
         config.endpoint = settings.port;
-        config.baudRate = static_cast<unsigned int>(std::max(settings.baudRate, 1));
+        config.baudRate = isSimulator_
+                              ? static_cast<unsigned int>(std::max(settings.baudRate, 1))
+                              : 9600U;
         // Most USB/RS-485 adapters control direction internally. Kernel
         // TIOCSRS485 can be enabled later for native UART endpoints.
         config.rs485 = false;
         config.readTimeout = 100ms;
         const auto result = wait(controller_->connect(std::move(config)), 2s);
-        if (result.ok) emit(isSimulator_ ? "CORE Simulador conectado ao ControllerService"
-                                        : "CORE Transporte serial POSIX conectado", false);
+        if (result.ok) emit(isSimulator_ ? "CORE Simulador AISG 2 conectado"
+                                        : "CORE Serial AISG Base 3.0.8 conectado a 9600 8N1",
+                            false);
         return result;
     }
 
@@ -90,15 +106,19 @@ public:
         if (!connected()) return {};
         atc::ScanOptions options;
         options.firstAddress = 1;
-        options.lastAddress = isSimulator_ ? 4 : 32;
-        options.responseTimeout = isSimulator_ ? 10ms : 75ms;
-        const auto result = wait(controller_->scan(options), isSimulator_ ? 3s : 8s);
+        options.lastAddress = isSimulator_ ? 4 : 254;
+        options.responseTimeout = isSimulator_ ? 10ms : 250ms;
+        options.protocol = isSimulator_ ? atc::ProtocolProfile::legacyAisg2
+                                        : atc::ProtocolProfile::aisg3;
+        options.primaryId = stablePrimaryId();
+        const auto result = wait(controller_->scan(options), isSimulator_ ? 3s : 120s);
         if (!result.ok) return {};
 
         // Populate alarm state through the same HDLC/EP path used by hardware.
         const auto discovered = controller_->devices();
         for (const auto& device : discovered) {
-            (void)wait(controller_->refreshAlarms(device.address), 1s);
+            (void)wait(controller_->refreshAlarms(device.address),
+                       device.protocol == atc::ProtocolProfile::aisg3 ? 30s : 1s);
         }
         return snapshot();
     }
@@ -111,18 +131,20 @@ public:
     }
 
     OperationResult refresh(DeviceRecord& device) override {
-        const auto result = wait(controller_->refresh(device.address), 2s);
+        const auto result = wait(controller_->refresh(device.address), device.aisg3 ? 10s : 2s);
         update(device);
         return result;
     }
 
     OperationResult setTilt(DeviceRecord& device, const double targetDegrees) override {
+        if (device.aisg3) return unsupportedAisg3Write();
         const auto result = wait(controller_->moveRet(device.address, targetDegrees), 3s);
         update(device);
         return result;
     }
 
     OperationResult setGain(DeviceRecord& device, const double targetDb) override {
+        if (device.aisg3) return unsupportedAisg3Write();
         if (device.kind != DeviceKind::Tma) return {false, "O dispositivo selecionado não é um TMA"};
         if (!std::isfinite(targetDb) || targetDb < 0.0 || targetDb > 31.75) {
             return {false, "Ganho fora do intervalo 0–31,75 dB"};
@@ -133,6 +155,7 @@ public:
     }
 
     OperationResult setBypass(DeviceRecord& device, const bool bypass) override {
+        if (device.aisg3) return unsupportedAisg3Write();
         if (device.kind != DeviceKind::Tma) return {false, "O dispositivo selecionado não é um TMA"};
         const auto result = wait(controller_->setTmaMode(
             device.address, bypass ? atc::TmaMode::bypass : atc::TmaMode::normal), 2s);
@@ -141,24 +164,27 @@ public:
     }
 
     OperationResult calibrate(DeviceRecord& device) override {
+        if (device.aisg3) return unsupportedAisg3Write();
         const auto result = wait(controller_->calibrate(device.address), 3s);
         update(device);
         return result;
     }
 
     OperationResult selfTest(DeviceRecord& device) override {
+        if (device.aisg3) return unsupportedAisg3Write();
         const auto result = wait(controller_->runSelfTest(device.address), 3s);
         update(device);
         return result;
     }
 
     OperationResult clearAlarms(DeviceRecord& device) override {
-        const auto result = wait(controller_->clearAlarms(device.address), 2s);
+        const auto result = wait(controller_->clearAlarms(device.address), device.aisg3 ? 15s : 2s);
         update(device);
         return result;
     }
 
     OperationResult saveConfiguration(DeviceRecord& device) override {
+        if (device.aisg3) return unsupportedAisg3Write();
         const auto installation = atc::InstallationData{
             .antennaModel = device.antennaModel,
             .antennaSerial = device.serial,
@@ -192,6 +218,12 @@ public:
     }
 
 private:
+    static OperationResult unsupportedAisg3Write() {
+        return {false,
+                "Operação não habilitada no perfil AISG 3.0.8: somente descoberta, "
+                "negociação, leitura Base/ADB e alarmes foram validados"};
+    }
+
     OperationResult wait(const atc::OperationId operation,
                          const std::chrono::milliseconds timeout) {
         currentOperation_.store(operation);
@@ -279,6 +311,8 @@ private:
         destination.serial = source.serialNumber;
         destination.hardwareVersion = source.hardwareVersion;
         destination.softwareVersion = source.softwareVersion;
+        destination.aisgVersion = source.protocol == atc::ProtocolProfile::aisg3 ? "3.0.8" : "2.0";
+        destination.aisg3 = source.protocol == atc::ProtocolProfile::aisg3;
         destination.antennaModel = installation.antennaModel;
         destination.baseStation = installation.baseStationId;
         destination.sector = installation.sectorId;
@@ -289,7 +323,11 @@ private:
         destination.mechanicalTilt = installation.mechanicalTiltDegrees;
         destination.bearing = installation.bearingDegrees;
         destination.height = installation.heightMeters;
+        if (!installation.antennaSerial.empty()) {
+            destination.serial = installation.antennaSerial;
+        }
         destination.activeAlarms = static_cast<int>(source.alarms.size());
+        if (destination.aisg3) destination.calibrated = false;
         if (const auto* ret = source.ret()) {
             destination.electricalTilt = ret->electricalTiltDegrees;
             destination.minimumTilt = ret->minimumTiltDegrees;

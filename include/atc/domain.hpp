@@ -9,7 +9,8 @@
 
 namespace atc {
 
-enum class DeviceKind { unknown, ret, tma };
+enum class DeviceKind { unknown, ret, tma, adb };
+enum class ProtocolProfile { legacyAisg2, aisg3 };
 enum class DeviceStatus { disconnected, discovered, initializing, ready, busy, alarm, fault };
 enum class AlarmSeverity { information, warning, critical };
 
@@ -60,6 +61,13 @@ struct Tma {
 
 using DeviceDetails = std::variant<std::monostate, Ret, Tma>;
 
+struct DeviceSubunit {
+    std::uint16_t number{};
+    DeviceKind kind{DeviceKind::unknown};
+
+    friend bool operator==(const DeviceSubunit&, const DeviceSubunit&) = default;
+};
+
 struct Device {
     std::uint8_t address{};
     std::string uid;
@@ -68,10 +76,12 @@ struct Device {
     std::string serialNumber;
     std::string hardwareVersion;
     std::string softwareVersion;
+    ProtocolProfile protocol{ProtocolProfile::legacyAisg2};
     DeviceKind kind{DeviceKind::unknown};
     DeviceStatus status{DeviceStatus::disconnected};
     InstallationData installation;
     DeviceDetails details;
+    std::vector<DeviceSubunit> subunits;
     std::vector<Alarm> alarms;
     std::uint64_t revision{};
 
@@ -82,6 +92,7 @@ struct Device {
 };
 
 [[nodiscard]] const char* toString(DeviceKind value) noexcept;
+[[nodiscard]] const char* toString(ProtocolProfile value) noexcept;
 [[nodiscard]] const char* toString(DeviceStatus value) noexcept;
 [[nodiscard]] const char* toString(AlarmSeverity value) noexcept;
 

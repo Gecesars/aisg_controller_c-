@@ -52,6 +52,7 @@ QString kindName(DeviceKind kind) {
     switch (kind) {
     case DeviceKind::Ret: return QStringLiteral("RET");
     case DeviceKind::Tma: return QStringLiteral("TMA");
+    case DeviceKind::Adb: return QStringLiteral("ADB");
     case DeviceKind::Sensor: return QStringLiteral("Sensor");
     case DeviceKind::Unknown: return QStringLiteral("Desconhecido");
     }
@@ -247,7 +248,7 @@ QWidget* MainWindow::buildConnectionBar() {
     layout->addWidget(mutedLabel(QStringLiteral("TRANSPORTE")));
     transportCombo_ = new QComboBox;
     transportCombo_->addItem(QStringLiteral("Simulador integrado"), true);
-    transportCombo_->addItem(QStringLiteral("Serial RS-485 (experimental)"), false);
+    transportCombo_->addItem(QStringLiteral("Serial RS-485 • AISG 3.0.8"), false);
     transportCombo_->setMinimumWidth(210);
     layout->addWidget(transportCombo_);
 
@@ -293,9 +294,11 @@ QWidget* MainWindow::buildConnectionBar() {
     connect(transportCombo_, &QComboBox::currentIndexChanged, this, [this] {
         const bool simulator = transportCombo_->currentData().toBool();
         portCombo_->setCurrentText(simulator ? QStringLiteral("virtual://aisg") : QStringLiteral("/dev/ttyUSB0"));
+        if (!simulator) baudCombo_->setCurrentText(QStringLiteral("9600"));
+        baudCombo_->setEnabled(simulator && !backend_->connected());
         simulatorBanner_->setVisible(simulator);
         appendLog(simulator ? QStringLiteral("Transporte selecionado: simulador integrado")
-                            : QStringLiteral("Transporte serial selecionado: requer validação de hardware"));
+                            : QStringLiteral("Serial AISG Base 3.0.8 / ADB 3.1.7 selecionado (9600 8N1)"));
     });
     return panel;
 }
@@ -452,7 +455,7 @@ QWidget* MainWindow::buildOverviewTab() {
     form->addRow(QStringLiteral("Estação base"), stationValue_);
     form->addRow(QStringLiteral("Setor"), sectorValue_);
     form->addRow(separator());
-    auto* note = mutedLabel(QStringLiteral("O perfil de protocolo real é experimental. Frames e respostas permanecem disponíveis na aba de atividade para auditoria."));
+    auto* note = mutedLabel(QStringLiteral("Serial real: perfil auditado AISG Base 3.0.8 / ADB 3.1.7. Operações fora do perfil validado permanecem bloqueadas."));
     form->addRow(note);
     return page;
 }
@@ -677,8 +680,8 @@ void MainWindow::connectBackend() {
     if (backend_->connected()) return;
     const bool simulator = transportCombo_->currentData().toBool();
     if (!simulator) {
-        if (QMessageBox::warning(this, tr("Perfil serial experimental"),
-            tr("O transporte serial real só deve ser usado após validar o adaptador RS-485, o controle de direção e o perfil do fabricante.\n\nDeseja abrir a porta selecionada?"),
+        if (QMessageBox::warning(this, tr("Perfil serial AISG 3"),
+            tr("O perfil serial implementa descoberta e atribuição XID AISG Base 3.0.8, negociação e leitura ADB 3.1.7. Comandos de movimento e configuração permanecem bloqueados.\n\nValide o adaptador RS-485 com controle automático de direção antes do uso. Deseja abrir a porta selecionada?"),
             QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Ok) return;
     }
     ConnectionSettings settings{
@@ -774,7 +777,7 @@ void MainWindow::setConnectionState(bool connected) {
                                               : QStringLiteral("color: #94a3b8; font-weight: 700;"));
     transportCombo_->setEnabled(!connected);
     portCombo_->setEnabled(!connected);
-    baudCombo_->setEnabled(!connected);
+    baudCombo_->setEnabled(!connected && transportCombo_->currentData().toBool());
     connectAction_->setEnabled(!connected);
     disconnectAction_->setEnabled(connected);
     scanAction_->setEnabled(connected);
@@ -788,13 +791,13 @@ void MainWindow::updateActionState() {
     infoButton_->setEnabled(ready);
     alarmsButton_->setEnabled(ready);
     clearAlarmsButton_->setEnabled(ready && device->activeAlarms > 0);
-    selfTestButton_->setEnabled(ready);
-    const bool isRet = ready && device->kind == DeviceKind::Ret;
-    const bool isTma = ready && device->kind == DeviceKind::Tma;
+    selfTestButton_->setEnabled(ready && !device->aisg3);
+    const bool isRet = ready && !device->aisg3 && device->kind == DeviceKind::Ret;
+    const bool isTma = ready && !device->aisg3 && device->kind == DeviceKind::Tma;
     moveButton_->setEnabled(isRet && device->calibrated);
     moveSectorButton_->setEnabled(isRet);
     calibrateButton_->setEnabled(isRet);
-    applyConfigButton_->setEnabled(ready);
+    applyConfigButton_->setEnabled(ready && !device->aisg3);
     targetTiltSpin_->setEnabled(isRet);
     gainSpin_->setEnabled(isTma);
     bypassCheck_->setEnabled(isTma);
@@ -1055,7 +1058,7 @@ void MainWindow::applyConfiguration() {
 void MainWindow::showManualAddressing() {
     if (!backend_->simulator()) {
         QMessageBox::warning(this, tr("Endereçamento manual"),
-            tr("A atribuição XID real permanece desabilitada até validação do perfil de descoberta. Nenhum quadro foi enviado."));
+            tr("A descoberta serial já atribui endereços automaticamente pela árvore XID AISG 3. O editor manual não é usado no perfil real; nenhum quadro foi enviado."));
         return;
     }
     QDialog dialog(this);
@@ -1137,7 +1140,7 @@ void MainWindow::showAbout() {
         tr("<h3>Antenna Tilt Controller</h3>"
            "<p>Reconstrução clean-room em C++20 e Qt 6 para Linux.</p>"
            "<p>A interface foi inspirada nos fluxos operacionais do ATC Lite. O núcleo HDLC/AISG, o transporte e o simulador são implementações novas.</p>"
-           "<p><b>Perfil real:</b> experimental até validação com equipamento e documentação licenciada do fabricante.</p>"));
+           "<p><b>Perfil real:</b> AISG Base 3.0.8 / ADB 3.1.7, auditado documentalmente e testado sem hardware. Certificação e interoperabilidade física ainda exigem bancada AISG.</p>"));
 }
 
 void MainWindow::showUnsupportedFirmware() {

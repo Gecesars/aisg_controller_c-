@@ -43,3 +43,6 @@ core.*
 /CMakeUserPresets.json
 *.user
 .DS_Store
+
+# Normative PDFs are local validation inputs and must not be redistributed.
+/AISG-*.pdf

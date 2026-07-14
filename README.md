@@ -5,18 +5,19 @@
 ![Qt 6](https://img.shields.io/badge/Qt-6.4%2B-41CD52?logo=qt&logoColor=white)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Controlador desktop para Linux, escrito em C++20 e Qt 6, para descoberta,
-diagnóstico e operação de dispositivos AISG, RET e TMA. O projeto reúne uma
-interface moderna, um núcleo de protocolo testável, transporte serial POSIX e
-um simulador integrado que permite conhecer todo o fluxo sem conectar hardware.
+Controlador desktop para Linux, escrito em C++20 e Qt 6, para descoberta e
+diagnóstico de dispositivos AISG. O modo serial implementa um perfil auditado
+AISG Base 3.0.8 / ADB 3.1.7; o simulador preserva os fluxos visuais de RET e TMA
+sem movimentar hardware.
 
 ![Antenna Tilt Controller executando o cenário simulado](docs/images/atc-demo.png)
 
 > [!IMPORTANT]
-> A versão atual é uma beta técnica. O simulador funciona de ponta a ponta; o
-> perfil serial real é experimental e ainda não foi validado com uma estação
-> AISG física. Antes de qualquer operação em campo, confirme pinagem, alimentação,
-> terminação, endereço, perfil do fabricante e limites mecânicos da antena.
+> A versão atual é uma beta técnica. O perfil Base/ADB foi conferido contra as
+> revisões normativas e testado de ponta a ponta com um ALD determinístico, mas
+> ainda não foi ensaiado com uma estação AISG física. Isso não equivale a
+> certificação AISG. Antes do uso em campo, valide interface elétrica, direção
+> RS-485, alimentação e terminação em bancada.
 
 ## Visão geral
 
@@ -27,13 +28,13 @@ executados por este projeto.
 
 O mesmo núcleo C++ processa as operações do simulador e do transporte serial:
 
-- conexão, desconexão, descoberta assíncrona e cancelamento;
+- conexão, desconexão, descoberta XID assíncrona e cancelamento;
 - inventário de dispositivos com filtros para RET, TMA e alarmes;
 - leitura de produto, serial, versões de hardware/software e dados do site;
-- consulta e limpeza de alarmes, self-test e calibração;
-- movimento individual de RET e movimento sequencial por setor;
-- configuração de ganho e modo normal/bypass de TMA;
-- edição validada dos dados de instalação;
+- consulta e limpeza de alarmes Base;
+- negociação de versão e leitura de identificação/instalação ADB;
+- codecs para os sete comandos ADB 3.1.7;
+- fluxos simulados de movimento RET, calibração, ganho e bypass TMA;
 - relatório CSV, log de atividade e auditoria dos quadros HDLC TX/RX;
 - simulador determinístico com dois RETs e um TMA;
 - serial Linux baseada em `termios`, `poll` e timeouts explícitos.
@@ -43,14 +44,20 @@ O mesmo núcleo C++ processa as operações do simulador e do transporte serial:
 | Função | Simulador | Serial real |
 |---|---|---|
 | Conectar e desconectar | Funcional | Implementado, não validado em hardware |
-| Descobrir endereços existentes | Funcional | Experimental, SNRM/UA nos endereços 1–32 |
-| Informações, alarmes e self-test | Funcional | Perfil experimental |
-| Tilt individual e por setor | Funcional | Perfil experimental, exige confirmação |
-| Calibração RET | Funcional | Perfil experimental |
-| Ganho e bypass TMA | Funcional | Perfil experimental |
-| CRC, framing e streaming HDLC | Testado | Mesmo núcleo testado |
-| Descoberta/atribuição automática XID | Não implementada | Não implementada |
+| Device Scan v1 e atribuição XID | N/A | Implementado, endereços 1–254 |
+| Resolução de colisões UID + porta | N/A | Implementado e testado |
+| SNRM/UA e informações Base | Funcional no perfil legado | Implementado e testado |
+| Negociação e leitura ADB 3.1.7 | N/A | Implementado e testado |
+| Consulta e limpeza de alarmes | Funcional | Implementado e testado |
+| Tilt individual e por setor | Funcional | Bloqueado: requer AISG-ST-RET v3 |
+| Calibração e self-test | Funcional | Bloqueado: requer padrão da subunidade |
+| Ganho e bypass TMA | Funcional | Bloqueado: requer AISG-ST-TMA v3 |
+| CRC, framing e streaming HDLC | Testado | Testado |
+| Escrita ADB / RF Path IDs | N/A | Codec testado; envio bloqueado na interface |
 | Firmware, download e factory reset | Bloqueado | Bloqueado intencionalmente |
+
+A matriz detalhada, incluindo os limites do perfil, está em
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
 ## Arquitetura
 
@@ -58,7 +65,7 @@ O mesmo núcleo C++ processa as operações do simulador e do transporte serial:
 flowchart LR
     UI[Interface Qt Widgets] --> B[Backend da interface]
     B --> C[ControllerService assíncrono]
-    C --> A[Procedimentos AISG]
+    C --> A[Perfis AISG 2 simulado e Base 3 / ADB]
     A --> H[Codec e decoder HDLC]
     H --> T{ITransport}
     T --> S[Simulador determinístico]
@@ -166,12 +173,15 @@ Encerre a sessão e entre novamente para que o novo grupo seja aplicado. Depois:
 1. conecte o hardware seguindo a documentação do fabricante;
 2. selecione **Serial / RS-485**;
 3. informe uma porta como `/dev/ttyUSB0`;
-4. escolha o baud rate exigido pelo dispositivo — `9600` é o padrão inicial;
-5. conecte e faça a descoberta;
-6. confira endereço, serial, setor e limites antes de enviar qualquer comando.
+4. conecte; o perfil serial fixa `9600 8N1`, conforme AISG Base;
+5. faça a descoberta XID e aguarde a atribuição/negociação;
+6. confira UID, endereço, serial da antena, setor e versões na tabela.
 
-A descoberta real atual apenas sonda endereços já atribuídos, de 1 a 32. Ela
-não executa a árvore XID nem atribui endereços automaticamente.
+A descoberta procura portas ALD em `NoAddress`, resolve colisões no padrão de
+21 octetos (UID + porta), confirma a identidade, atribui endereços de 1 a 254 e
+negocia Base 3.0.8/ADB 3.1.7. Por segurança, o aplicativo não transmite um
+`ResetPort` em broadcast; um ALD que mantenha um endereço de outra sessão pode
+precisar ser reiniciado de forma controlada na bancada.
 
 ## Opções de linha de comando
 
@@ -220,14 +230,19 @@ O pacote é criado em `dist/` com a versão e a arquitetura detectada pelo CMake
 
 ## Testes
 
-A suíte cobre sete cenários de protocolo, domínio, transporte e controlador:
+A suíte cobre 12 cenários de protocolo, domínio, transporte e controlador:
 
 - CRC-16/X-25 e quadros capturados;
 - stuffing, unstuffing e decoder incremental;
+- XID v3, atribuição e limites de quadro;
+- cabeçalho Layer 7, erros, alarmes e negociação de versões;
+- sete comandos ADB 3.1.7, UTF-8, proveniência e unidades mecânicas;
+- cálculo normativo de PrimaryID por SHA-1;
 - validações do domínio;
 - simulador em baixo nível;
 - falha segura do transporte serial POSIX;
 - fluxo ponta a ponta do controlador;
+- fluxo ponta a ponta Base 3.0.8/ADB 3.1.7 com um ALD determinístico;
 - cancelamento de operação.
 
 Execução direta:
@@ -260,6 +275,8 @@ offscreen da GUI em Ubuntu.
 ├── include/atc/                 API pública do núcleo
 ├── src/
 │   ├── aisg.cpp                 codecs de procedimentos AISG experimentais
+│   ├── aisg3.cpp                XID e Layer 7 AISG Base 3.0.8
+│   ├── adb.cpp                  codecs AISG-ST-ADB 3.1.7
 │   ├── controller.cpp           fila, eventos e operações assíncronas
 │   ├── domain.cpp               modelo e validações
 │   ├── hdlc.cpp                 CRC, framing e decoder incremental
@@ -268,17 +285,23 @@ offscreen da GUI em Ubuntu.
 │   └── gui/                     aplicação Qt Widgets
 ├── tests/test_main.cpp          testes sem framework externo
 ├── resources/                   ícone e entrada desktop
-├── docs/images/                 imagens curadas para a documentação
+├── docs/                        matriz de compatibilidade e imagens
 ├── scripts/                     build e empacotamento Linux
 └── licenses/                    avisos das referências permitidas
 ```
 
 ## Protocolo e interoperabilidade
 
-O núcleo implementa CRC-16/X-25, delimitadores e byte stuffing HDLC, decoder de
-stream, troca SNRM/UA e um conjunto experimental de I-frames para as operações
-expostas na interface. Os opcodes e perfis precisam ser conferidos contra a
-especificação e a documentação do fabricante antes do uso em campo.
+O núcleo serial implementa CRC-16/X-25, delimitadores e byte stuffing HDLC,
+limites de quadro, Device Scan v1, resolução de colisões, atribuição XID,
+SNRM/UA, Layer 7 Base, negociação de subunidade e ADB 3.1.7. Endianess, strings,
+versões, proveniência e intervalos mecânicos são validados antes de os dados
+entrarem no domínio da aplicação.
+
+Consulte [a matriz de compatibilidade](docs/COMPATIBILITY.md) para os requisitos
+implementados e para funções Base fora do perfil. O projeto não declara
+certificação AISG nem compatibilidade universal com hardware ou extensões de
+fabricante.
 
 Referências normativas úteis:
 
@@ -286,13 +309,11 @@ Referências normativas úteis:
 - [ETSI TS 125 462](https://www.etsi.org/deliver/etsi_ts/125400_125499/125462/06.05.01_60/ts_125462v060501p.pdf)
 - [ETSI TS 125 466](https://www.etsi.org/deliver/etsi_ts/125400_125499/125466/17.00.00_60/ts_125466v170000p.pdf)
 
-Este projeto não declara certificação AISG nem compatibilidade universal com
-perfis proprietários.
-
 ## Segurança operacional
 
 - O modo simulado deve ser usado durante desenvolvimento e treinamento.
-- Toda movimentação real exige confirmação explícita na interface.
+- Movimentação, calibração, self-test e configuração real ficam bloqueados até
+  os padrões AISG-ST-RET/TMA correspondentes serem implementados e ensaiados.
 - O destino deve ser conferido por endereço, UID/serial e setor.
 - O tilt solicitado é validado contra os limites conhecidos do RET.
 - Movimento de setor é sequencial, não atômico, e pode terminar parcialmente.
@@ -320,8 +341,9 @@ apropriado (`dialout` na maioria das distribuições) e reconecte o adaptador.
 ### Nenhum dispositivo é encontrado
 
 Teste primeiro o simulador. No hardware, confira alimentação externa, A/B,
-terra de referência, terminação, baud rate, controle automático de direção e
-se os dispositivos já possuem endereços entre 1 e 32.
+terra de referência, terminação, `9600 8N1` e controle automático de direção.
+A descoberta Base v3 só recebe resposta de portas no estado `NoAddress`; veja a
+observação sobre `ResetPort` na seção de conexão serial.
 
 ### Timeout ou respostas HDLC incompletas
 
@@ -337,9 +359,10 @@ necessário um ambiente gráfico Qt compatível.
 ## Limitações e roadmap
 
 - validar serial e operações com hardware AISG real;
-- implementar descoberta, atribuição e negociação XID completas;
 - oferecer `TIOCSRS485` configurável para UARTs nativas;
-- separar perfis/opcodes por fabricante e versão do protocolo;
+- implementar RR/RNR/FRMR, recuperação de link e tráfego assíncrono completos;
+- implementar os perfis AISG-ST-RET e AISG-ST-TMA v3;
+- ampliar o perfil primário Base (MALD, site mapping, upload/download e Ping);
 - ampliar testes com capturas independentes e hardware-in-the-loop;
 - adicionar pacotes nativos e releases reproduzíveis;
 - manter firmware e factory reset fora do escopo até existir uma cadeia de

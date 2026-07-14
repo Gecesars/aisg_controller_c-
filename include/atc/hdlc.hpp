@@ -14,6 +14,8 @@ using Bytes = std::vector<std::uint8_t>;
 inline constexpr std::uint8_t flag = 0x7E;
 inline constexpr std::uint8_t escape = 0x7D;
 inline constexpr std::uint8_t escapeXor = 0x20;
+inline constexpr std::size_t maximumInformationBytes = 264;
+inline constexpr std::size_t maximumUnescapedFrameBytes = 268;
 
 struct Frame {
     std::uint8_t address{};
@@ -39,7 +41,9 @@ struct DecodeResult {
 
 class StreamDecoder {
 public:
-    explicit StreamDecoder(std::size_t maximumFrameBytes = 4096);
+    // AISG v3.0 section 11.5 limits an unescaped layer-2 frame, including
+    // address, control and FCS, to 268 octets.
+    explicit StreamDecoder(std::size_t maximumFrameBytes = maximumUnescapedFrameBytes);
 
     [[nodiscard]] std::vector<DecodeResult> push(std::span<const std::uint8_t> bytes);
     void reset() noexcept;

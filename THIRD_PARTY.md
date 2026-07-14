@@ -10,7 +10,8 @@ As implementações C++ de CRC, HDLC, transporte, domínio, controlador e interf
 são novas e cobertas por testes próprios.
 
 As especificações AISG e ETSI/3GPP citadas pelo material de referência possuem
-direitos e condições próprios. PDFs, textos normativos, firmware, CAD e SDKs do
-repositório de referência não são redistribuídos. Para validação normativa use
-as publicações oficiais aplicáveis, incluindo 3GPP TS 25.462/37.462 e ETSI TS
-125 463/125 466.
+direitos e condições próprios. Os documentos **AISG Base Standard v3.0.8.2** e
+**AISG-ST-ADB vADB3.1.7.6** foram usados localmente para revisão de formatos e
+procedimentos. PDFs, textos normativos, firmware, CAD e SDKs não são
+redistribuídos. A cobertura resultante está documentada em
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).

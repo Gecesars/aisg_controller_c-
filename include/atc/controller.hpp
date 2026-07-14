@@ -1,6 +1,7 @@
 #pragma once
 
 #include "atc/aisg.hpp"
+#include "atc/aisg3.hpp"
 #include "atc/domain.hpp"
 #include "atc/hdlc.hpp"
 #include "atc/transport.hpp"
@@ -53,6 +54,8 @@ struct ScanOptions {
     std::uint8_t firstAddress{1};
     std::uint8_t lastAddress{32};
     std::chrono::milliseconds responseTimeout{50};
+    ProtocolProfile protocol{ProtocolProfile::legacyAisg2};
+    std::uint32_t primaryId{0x41544331};
 };
 
 class ControllerService {
@@ -99,9 +102,19 @@ private:
                                                       const hdlc::Frame& request,
                                                       std::chrono::milliseconds timeout,
                                                       const std::shared_ptr<std::atomic_bool>& cancelled);
+    [[nodiscard]] std::optional<aisg3::Response> transactAisg3(
+        OperationId operation,
+        std::uint8_t address,
+        const aisg3::PrimaryCommand& command,
+        std::chrono::milliseconds timeout,
+        const std::shared_ptr<std::atomic_bool>& cancelled);
+    void scanAisg3(OperationId operation,
+                   const ScanOptions& options,
+                   const std::shared_ptr<std::atomic_bool>& cancelled);
     [[nodiscard]] Device requireDevice(std::uint8_t address) const;
     void storeDevice(Device device, OperationId operation, bool added = false);
     [[nodiscard]] std::uint8_t nextControl(std::uint8_t address);
+    [[nodiscard]] std::uint16_t nextAisg3Sequence() noexcept;
 
     std::shared_ptr<ITransport> transport_;
     std::jthread worker_;
@@ -111,6 +124,7 @@ private:
     bool activeWork_{};
     std::unordered_map<std::uint8_t, Device> devices_;
     std::unordered_map<std::uint8_t, aisg::ControlSequence> sequences_;
+    std::uint16_t aisg3Sequence_{};
 
     mutable std::mutex queueMutex_;
     std::condition_variable_any queueCondition_;

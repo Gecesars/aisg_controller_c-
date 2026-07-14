@@ -39,7 +39,16 @@ const char* toString(const DeviceKind value) noexcept {
     switch (value) {
     case DeviceKind::ret: return "RET";
     case DeviceKind::tma: return "TMA";
+    case DeviceKind::adb: return "ADB";
     case DeviceKind::unknown: return "Unknown";
+    }
+    return "Unknown";
+}
+
+const char* toString(const ProtocolProfile value) noexcept {
+    switch (value) {
+    case ProtocolProfile::legacyAisg2: return "AISG 2.0 experimental";
+    case ProtocolProfile::aisg3: return "AISG 3.0.8";
     }
     return "Unknown";
 }

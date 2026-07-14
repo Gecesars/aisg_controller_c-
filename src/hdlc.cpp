@@ -2,6 +2,7 @@
 
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 
 namespace atc::hdlc {
 namespace {
@@ -10,6 +11,10 @@ DecodeResult decodePayload(const std::span<const std::uint8_t> payload) {
     if (payload.size() < 4) {
         return {std::nullopt, DecodeError::tooShort,
                 "an HDLC frame needs address, control and two FCS bytes"};
+    }
+    if (payload.size() > maximumUnescapedFrameBytes) {
+        return {std::nullopt, DecodeError::frameTooLarge,
+                "HDLC frame exceeds the AISG maximum of 268 octets"};
     }
 
     const auto data = payload.first(payload.size() - 2);
@@ -44,6 +49,9 @@ std::uint16_t crc16X25(const std::span<const std::uint8_t> data) noexcept {
 }
 
 Bytes encode(const Frame& frame) {
+    if (frame.information.size() > maximumInformationBytes) {
+        throw std::invalid_argument("HDLC information exceeds the AISG maximum of 264 octets");
+    }
     Bytes payload;
     payload.reserve(frame.information.size() + 4);
     payload.push_back(frame.address);

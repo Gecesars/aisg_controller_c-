@@ -6,7 +6,9 @@ option(ATC_BUILD_TESTS "Build the protocol and controller tests" ON)
 option(ATC_BUILD_GUI "Build the Qt 6 desktop application" ON)
 
 add_library(atc_core
+    src/adb.cpp
     src/aisg.cpp
+    src/aisg3.cpp
     src/controller.cpp
     src/domain.cpp
     src/hdlc.cpp
@@ -92,7 +94,8 @@ if(ATC_BUILD_GUI)
     install(TARGETS antenna-tilt-controller RUNTIME DESTINATION bin)
     install(FILES resources/antenna-tilt-controller.desktop DESTINATION share/applications)
     install(FILES resources/antenna-tilt-controller.svg DESTINATION share/icons/hicolor/scalable/apps)
-    install(FILES README.md THIRD_PARTY.md SECURITY.md LICENSE DESTINATION share/doc/antenna-tilt-controller)
+    install(FILES README.md THIRD_PARTY.md SECURITY.md LICENSE docs/COMPATIBILITY.md
+        DESTINATION share/doc/antenna-tilt-controller)
     install(FILES licenses/ret_aisg2-MIT.txt DESTINATION share/doc/antenna-tilt-controller/licenses)
 endif()
 
