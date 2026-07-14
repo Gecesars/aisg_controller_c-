@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Antenna Tilt Controller
+Comment=Controle e diagnóstico de dispositivos AISG/RET
+Exec=antenna-tilt-controller
+Icon=antenna-tilt-controller
+Terminal=false
+Categories=Utility;Engineering;
+Keywords=AISG;RET;TMA;antenna;tilt;

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Build and test (Ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake ninja-build qt6-base-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DATC_BUILD_GUI=ON \
+            -DATC_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test core
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Test GUI offscreen
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ./build/antenna-tilt-controller --smoke-test
+          ./build/antenna-tilt-controller --demo-test
