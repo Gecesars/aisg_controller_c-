@@ -56,6 +56,8 @@ struct ScanOptions {
     std::chrono::milliseconds responseTimeout{50};
     ProtocolProfile protocol{ProtocolProfile::legacyAisg2};
     std::uint32_t primaryId{0x41544331};
+    bool discoverUnaddressed{};
+    bool resetBeforeDiscovery{};
 };
 
 class ControllerService {
@@ -98,6 +100,10 @@ private:
     void workerLoop(std::stop_token stopToken);
     void emit(ControllerEvent event);
     void logFrame(EventKind kind, OperationId operation, const hdlc::Bytes& encoded);
+    [[nodiscard]] bool transmit(OperationId operation,
+                                const hdlc::Bytes& encoded,
+                                const std::shared_ptr<std::atomic_bool>& cancelled);
+    void noteFrameActivity() noexcept;
     [[nodiscard]] std::optional<hdlc::Frame> transact(OperationId operation,
                                                       const hdlc::Frame& request,
                                                       std::chrono::milliseconds timeout,
@@ -109,6 +115,9 @@ private:
         std::chrono::milliseconds timeout,
         const std::shared_ptr<std::atomic_bool>& cancelled);
     void scanAisg3(OperationId operation,
+                   const ScanOptions& options,
+                   const std::shared_ptr<std::atomic_bool>& cancelled);
+    void scanAisg2(OperationId operation,
                    const ScanOptions& options,
                    const std::shared_ptr<std::atomic_bool>& cancelled);
     [[nodiscard]] Device requireDevice(std::uint8_t address) const;
@@ -125,6 +134,8 @@ private:
     std::unordered_map<std::uint8_t, Device> devices_;
     std::unordered_map<std::uint8_t, aisg::ControlSequence> sequences_;
     std::uint16_t aisg3Sequence_{};
+    std::chrono::milliseconds minimumFrameInterval_{};
+    std::optional<std::chrono::steady_clock::time_point> lastFrameActivity_;
 
     mutable std::mutex queueMutex_;
     std::condition_variable_any queueCondition_;

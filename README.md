@@ -7,8 +7,8 @@
 
 Controlador desktop para Linux, escrito em C++20 e Qt 6, para descoberta e
 diagnóstico de dispositivos AISG. O modo serial implementa um perfil auditado
-AISG Base 3.0.8 / ADB 3.1.7; o simulador preserva os fluxos visuais de RET e TMA
-sem movimentar hardware.
+AISG Base 3.0.8 / ADB 3.1.7 e um perfil AISG 2.0 experimental para RET/TMA; o
+simulador integrado preserva os mesmos fluxos visuais sem movimentar hardware.
 
 ![Antenna Tilt Controller executando o cenário simulado](docs/images/atc-demo.png)
 
@@ -23,12 +23,12 @@ sem movimentar hardware.
 
 Esta é uma implementação clean-room. O aplicativo Windows legado foi usado
 somente como referência visual e para inventariar fluxos de trabalho. Código
-decompilado, binários, firmware e módulos Python não são distribuídos nem
-executados por este projeto.
+decompilado, binários, firmware e módulos Python do aplicativo legado não são
+distribuídos nem executados por este projeto.
 
 O mesmo núcleo C++ processa as operações do simulador e do transporte serial:
 
-- conexão, desconexão, descoberta XID assíncrona e cancelamento;
+- conexão, desconexão, sondagem AISG 2.0 ou descoberta XID e cancelamento;
 - inventário de dispositivos com filtros para RET, TMA e alarmes;
 - leitura de produto, serial, versões de hardware/software e dados do site;
 - consulta e limpeza de alarmes Base;
@@ -49,9 +49,9 @@ O mesmo núcleo C++ processa as operações do simulador e do transporte serial:
 | SNRM/UA e informações Base | Funcional no perfil legado | Implementado e testado |
 | Negociação e leitura ADB 3.1.7 | N/A | Implementado e testado |
 | Consulta e limpeza de alarmes | Funcional | Implementado e testado |
-| Tilt individual e por setor | Funcional | Bloqueado: requer AISG-ST-RET v3 |
-| Calibração e self-test | Funcional | Bloqueado: requer padrão da subunidade |
-| Ganho e bypass TMA | Funcional | Bloqueado: requer AISG-ST-TMA v3 |
+| Tilt individual e por setor | Funcional | AISG 2 experimental; bloqueado no perfil v3 |
+| Calibração e self-test | Funcional | AISG 2 experimental; bloqueado no perfil v3 |
+| Ganho e bypass TMA | Funcional | AISG 2 experimental; bloqueado no perfil v3 |
 | CRC, framing e streaming HDLC | Testado | Testado |
 | Escrita ADB / RF Path IDs | N/A | Codec testado; envio bloqueado na interface |
 | Firmware, download e factory reset | Bloqueado | Bloqueado intencionalmente |
@@ -65,7 +65,7 @@ A matriz detalhada, incluindo os limites do perfil, está em
 flowchart LR
     UI[Interface Qt Widgets] --> B[Backend da interface]
     B --> C[ControllerService assíncrono]
-    C --> A[Perfis AISG 2 simulado e Base 3 / ADB]
+    C --> A[Perfis AISG 2 e Base 3 / ADB]
     A --> H[Codec e decoder HDLC]
     H --> T{ITransport}
     T --> S[Simulador determinístico]
@@ -150,6 +150,42 @@ O simulador é o modo inicial e não acessa portas nem movimenta hardware:
 O cenário contém RETs nos endereços `0x01` e `0x02` e um TMA no endereço
 `0x03`. Um dos RETs começa com um alarme simulado para exercitar o diagnóstico.
 
+### Testar controlador e RET em duas portas virtuais
+
+O utilitário Python em [`simulador_serial/`](simulador_serial/README.md) cria
+duas PTYs interligadas, compila/inicia automaticamente o `ret_core` C e
+registra em tempo real, nos dois sentidos, cada quadro AISG 2.0 no formato do
+arquivo `dois rets.txt`:
+
+```sh
+python3 -m simulador_serial.simulador_serial
+```
+
+Selecione **Serial RS-485 • AISG 2.0** e `/tmp/aisg_controlador` nesta
+aplicação. Dois RETs automáticos abrem `/tmp/aisg_ret` em `NoAddress`; a
+descoberta XID lhes atribui `0x01` e `0x02`. O terminal mostra linhas como
+`[3803.65 ms] [TX] Quadro: 7E ... 7E | Intervalo: 101.39 ms`, e o log
+persistente fica em `simulador_serial/frames_aisg2.log`.
+
+Neste perfil de bancada, cada novo TX aguarda `1000 ms` de silêncio depois do
+último quadro observado. Quando uma operação demorada retorna apenas RR, o
+controlador mantém a numeração HDLC e continua consultando o resultado com RR/P
+a cada pausa enquanto o RET responder RR. A consulta termina somente quando
+chega a resposta RETAP final ou quando expira o timeout proporcional da operação.
+
+Cada descoberta na porta virtual começa com `Reset Device` XID em broadcast,
+garantindo que uma reconexão encontre novamente os dois RETs em `NoAddress`.
+Essa automação é exclusiva da bancada virtual; portas seriais reais não recebem
+reset broadcast implícito. Um ACK de negociação de release perdido pode ser
+consultado uma segunda e última vez antes de a operação falhar.
+
+Os limites elétricos são consultados do RET pelos campos AISG `0x06/0x07`, em
+vez de presumidos pela interface. Na bancada, os dois dispositivos anunciam
+`0,0°..15,0°`; `Set Tilt` usa o payload sRET de dois octetos e aguarda a conclusão
+assíncrona antes de atualizar a posição exibida. O motor virtual leva exatamente
+`2 s/°`, calculados por `|tilt alvo - tilt atual|`; durante todo esse intervalo o
+RET permanece responsivo ao handshake HDLC.
+
 ## Usar uma conexão serial real
 
 > [!WARNING]
@@ -171,13 +207,15 @@ sudo usermod -aG dialout "$USER"
 Encerre a sessão e entre novamente para que o novo grupo seja aplicado. Depois:
 
 1. conecte o hardware seguindo a documentação do fabricante;
-2. selecione **Serial / RS-485**;
+2. selecione **Serial RS-485 • AISG 2.0** para RET/TMA legado ou
+   **Serial RS-485 • AISG 3.0.8** para Base 3/ADB;
 3. informe uma porta como `/dev/ttyUSB0`;
 4. conecte; o perfil serial fixa `9600 8N1`, conforme AISG Base;
 5. faça a descoberta XID e aguarde a atribuição/negociação;
 6. confira UID, endereço, serial da antena, setor e versões na tabela.
 
-A descoberta procura portas ALD em `NoAddress`, resolve colisões no padrão de
+No perfil **Serial RS-485 • AISG 3.0.8**, a descoberta procura portas ALD em
+`NoAddress`, resolve colisões no padrão de
 21 octetos (UID + porta), confirma a identidade, atribui endereços de 1 a 254 e
 negocia Base 3.0.8/ADB 3.1.7. Por segurança, o aplicativo não transmite um
 `ResetPort` em broadcast; um ALD que mantenha um endereço de outra sessão pode
@@ -284,6 +322,7 @@ offscreen da GUI em Ubuntu.
 │   ├── simulated_transport.cpp
 │   └── gui/                     aplicação Qt Widgets
 ├── tests/test_main.cpp          testes sem framework externo
+├── simulador_serial/            PTYs, ponte e monitor Python AISG 2.0
 ├── resources/                   ícone e entrada desktop
 ├── docs/                        matriz de compatibilidade e imagens
 ├── scripts/                     build e empacotamento Linux

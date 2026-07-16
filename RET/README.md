@@ -38,6 +38,7 @@ RET/
 ├── include/ret/              API pública do protocolo
 ├── src/                      HDLC e RETAP independentes de hardware
 ├── platform/stm32f4/         HAL, pinagem, motor, flash, startup e linker
+├── platform/host/            adaptador POSIX para bancada virtual
 ├── tests/                    testes executados no computador
 ├── docs/                     hardware e matriz de conformidade
 └── cmake/                    toolchain GNU Arm Embedded
@@ -73,6 +74,29 @@ cmake -S RET -B RET/build-host -DRET_BUILD_STM32=OFF
 cmake --build RET/build-host --parallel
 ctest --test-dir RET/build-host --output-on-failure
 ```
+
+O mesmo build também produz `RET/build-host/ret_host`. Ele executa o `ret_core`
+do firmware em uma porta serial POSIX, substituindo somente os periféricos. O
+exemplo abaixo cria dois RETs em `NoAddress`, com UIDs distintos, no mesmo
+barramento:
+
+```bash
+RET/build-host/ret_host --port /tmp/aisg_ret --devices 2
+```
+
+Normalmente não é necessário chamá-lo diretamente: o utilitário
+`simulador_serial` compila e inicia esse executável automaticamente. Para um
+teste legado com endereços já atribuídos, acrescente `--address 1`; as instâncias
+receberão endereços sequenciais.
+
+No backend POSIX, um comando `Set Tilt` simula o deslocamento por
+`|alvo - posição atual| × 2 segundos por grau`. O procedimento permanece
+assíncrono no mesmo `ret_core` do STM32: o primeiro retorno e cada consulta
+RR/P recebem RR enquanto o motor está em movimento, e a resposta RETAP de
+sucesso só é transmitida depois que o tempo de deslocamento termina. Calibração
+e autoteste conservam o atraso determinístico curto de bancada. No STM32 real,
+o término continua sendo definido pelo sensor e pelo backend físico do motor,
+não por esse relógio artificial.
 
 Uma execução com ASan/UBSan pode ser criada assim:
 

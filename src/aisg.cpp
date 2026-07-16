@@ -7,6 +7,60 @@
 namespace atc::aisg {
 namespace {
 
+constexpr std::uint8_t xidFormatIdentifier = 0x81;
+constexpr std::uint8_t xidUserGroup = 0xF0;
+
+struct XidParameterView {
+    std::uint8_t identifier{};
+    std::span<const std::uint8_t> value;
+};
+
+std::optional<std::vector<XidParameterView>> parseXid(
+    const std::span<const std::uint8_t> information) {
+    if (information.size() < 3 || information[0] != xidFormatIdentifier ||
+        information[1] != xidUserGroup || information[2] != information.size() - 3) {
+        return std::nullopt;
+    }
+    std::vector<XidParameterView> result;
+    std::size_t offset = 3;
+    while (offset < information.size()) {
+        if (information.size() - offset < 2) return std::nullopt;
+        const auto identifier = information[offset++];
+        const auto length = static_cast<std::size_t>(information[offset++]);
+        if (length > information.size() - offset) return std::nullopt;
+        result.push_back({identifier, information.subspan(offset, length)});
+        offset += length;
+    }
+    return result;
+}
+
+const XidParameterView* findParameter(const std::vector<XidParameterView>& parameters,
+                                      const std::uint8_t identifier) {
+    const auto found = std::find_if(parameters.begin(), parameters.end(),
+        [identifier](const auto& parameter) { return parameter.identifier == identifier; });
+    return found == parameters.end() ? nullptr : &*found;
+}
+
+hdlc::Bytes encodeXid(
+    const std::initializer_list<std::pair<std::uint8_t, hdlc::Bytes>> parameters) {
+    hdlc::Bytes body;
+    for (const auto& [identifier, value] : parameters) {
+        if (value.size() > std::numeric_limits<std::uint8_t>::max()) {
+            throw std::invalid_argument("AISG 2.0 XID parameter is too long");
+        }
+        body.push_back(identifier);
+        body.push_back(static_cast<std::uint8_t>(value.size()));
+        body.insert(body.end(), value.begin(), value.end());
+    }
+    if (body.size() > std::numeric_limits<std::uint8_t>::max()) {
+        throw std::invalid_argument("AISG 2.0 XID group is too long");
+    }
+    hdlc::Bytes result{xidFormatIdentifier, xidUserGroup,
+                       static_cast<std::uint8_t>(body.size())};
+    result.insert(result.end(), body.begin(), body.end());
+    return result;
+}
+
 constexpr std::array<std::uint8_t, 8> requestControls{
     0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE};
 constexpr std::array<std::uint8_t, 8> keepAliveControls{
@@ -45,10 +99,23 @@ std::string readLengthPrefixed(const hdlc::Bytes& bytes, std::size_t& offset, bo
 std::string statusMessage(const std::uint8_t code) {
     switch (code) {
     case 0x00: return "success";
-    case 0x01: return "command rejected";
-    case 0x02: return "busy";
-    case 0x03: return "invalid data";
-    default: return "device returned status " + std::to_string(code);
+    case 0x02: return "motor jam";
+    case 0x03: return "actuator jam";
+    case 0x05: return "device busy";
+    case 0x06: return "checksum error";
+    case 0x0B: return "operation failed";
+    case 0x0E: return "device is not calibrated";
+    case 0x0F: return "device is not configured";
+    case 0x11: return "hardware error";
+    case 0x13: return "value is out of range";
+    case 0x19: return "unknown procedure";
+    case 0x1D: return "read-only parameter";
+    case 0x1E: return "unknown parameter";
+    case 0x24: return "format error";
+    case 0x25: return "unsupported procedure";
+    default:
+        return "device returned status 0x" +
+               hdlc::toHex(std::span<const std::uint8_t>(&code, 1));
     }
 }
 
@@ -90,6 +157,85 @@ bool isResponseFor(const hdlc::Frame& response, const hdlc::Frame& request) noex
            response.information.front() == request.information.front();
 }
 
+hdlc::Frame makeDeviceScanRequest(const std::span<const std::uint8_t> uniqueId,
+                                  const std::span<const std::uint8_t> uniqueIdMask) {
+    if (uniqueId.size() != uniqueIdMask.size() || uniqueId.size() > 19) {
+        throw std::invalid_argument(
+            "AISG 2.0 scan UID and mask must have equal lengths up to 19 octets");
+    }
+    return {allStationsAddress, xidControl,
+            encodeXid({{1, hdlc::Bytes(uniqueId.begin(), uniqueId.end())},
+                       {3, hdlc::Bytes(uniqueIdMask.begin(), uniqueIdMask.end())}})};
+}
+
+std::optional<XidIdentity> parseDeviceScanResponse(const hdlc::Frame& frame) {
+    if (frame.address != noStationAddress || frame.control != xidControl) {
+        return std::nullopt;
+    }
+    const auto parameters = parseXid(frame.information);
+    if (!parameters) return std::nullopt;
+    const auto* uid = findParameter(*parameters, 1);
+    const auto* type = findParameter(*parameters, 4);
+    const auto* vendor = findParameter(*parameters, 6);
+    if (!uid || !type || !vendor || uid->value.size() < 3 || uid->value.size() > 19 ||
+        type->value.size() != 1 || vendor->value.size() != 2 ||
+        uid->value[0] != vendor->value[0] || uid->value[1] != vendor->value[1]) {
+        return std::nullopt;
+    }
+    XidIdentity result;
+    result.uniqueId.assign(uid->value.begin(), uid->value.end());
+    result.deviceType = type->value[0];
+    result.vendorCode = {static_cast<char>(vendor->value[0]),
+                         static_cast<char>(vendor->value[1])};
+    return result;
+}
+
+hdlc::Frame makeAddressAssignmentRequest(const XidIdentity& identity,
+                                         const std::uint8_t address) {
+    if (address == noStationAddress || address == allStationsAddress ||
+        identity.uniqueId.size() < 3 || identity.uniqueId.size() > 19 ||
+        static_cast<std::uint8_t>(identity.vendorCode[0]) != identity.uniqueId[0] ||
+        static_cast<std::uint8_t>(identity.vendorCode[1]) != identity.uniqueId[1]) {
+        throw std::invalid_argument("invalid AISG 2.0 address assignment");
+    }
+    return {allStationsAddress, xidControl,
+            encodeXid({{1, identity.uniqueId}, {2, {address}}})};
+}
+
+bool isAddressAssignmentResponse(const hdlc::Frame& frame,
+                                 const XidIdentity& identity,
+                                 const std::uint8_t address) {
+    if (frame.address != address || frame.control != xidControl) return false;
+    const auto parameters = parseXid(frame.information);
+    if (!parameters) return false;
+    const auto* uid = findParameter(*parameters, 1);
+    const auto* type = findParameter(*parameters, 4);
+    return uid && type && type->value.size() == 1 &&
+           std::ranges::equal(uid->value, identity.uniqueId) &&
+           type->value[0] == identity.deviceType;
+}
+
+hdlc::Frame makeReleaseNegotiationRequest(const std::uint8_t address,
+                                          const std::uint8_t release) {
+    if (address == noStationAddress || address == allStationsAddress) {
+        throw std::invalid_argument("AISG 2.0 release negotiation needs an assigned address");
+    }
+    return {address, xidControl, encodeXid({{5, {release}}})};
+}
+
+bool isReleaseNegotiationResponse(const hdlc::Frame& frame,
+                                  const std::uint8_t address) {
+    if (frame.address != address || frame.control != xidControl) return false;
+    const auto parameters = parseXid(frame.information);
+    if (!parameters) return false;
+    const auto* release = findParameter(*parameters, 5);
+    return release && release->value.size() == 1;
+}
+
+hdlc::Frame makeResetDeviceRequest(const std::uint8_t address) {
+    return {address, xidControl, encodeXid({{7, {}}})};
+}
+
 hdlc::Frame makeSnrm(const std::uint8_t address) { return {address, 0x93, {}}; }
 
 hdlc::Frame makeKeepAlive(const std::uint8_t address, const std::uint8_t control) {
@@ -112,7 +258,7 @@ hdlc::Frame makeSetTiltRequest(const std::uint8_t address,
     }
     const auto deciDegrees = static_cast<std::uint16_t>(std::lround(degrees * 10.0));
     return commandFrame(address, control, Command::setTilt,
-                        {0x03, 0x00, 0x00,
+                        {0x02, 0x00,
                          static_cast<std::uint8_t>(deciDegrees & 0xFFU),
                          static_cast<std::uint8_t>((deciDegrees >> 8U) & 0xFFU)});
 }
@@ -123,6 +269,11 @@ hdlc::Frame makeGetAlarmsRequest(const std::uint8_t address, const std::uint8_t 
 
 hdlc::Frame makeClearAlarmsRequest(const std::uint8_t address, const std::uint8_t control) {
     return commandFrame(address, control, Command::clearAlarms);
+}
+
+hdlc::Frame makeSubscribeAlarmsRequest(const std::uint8_t address,
+                                       const std::uint8_t control) {
+    return commandFrame(address, control, Command::subscribeAlarms);
 }
 
 hdlc::Frame makeSelfTestRequest(const std::uint8_t address, const std::uint8_t control) {
@@ -190,7 +341,11 @@ ProtocolStatus parseStatus(const hdlc::Frame& response, const Command expectedCo
         return {false, 0xFF, "AISG response is truncated"};
     }
     const auto code = response.information[3];
-    return {code == 0, code, statusMessage(code)};
+    auto message = statusMessage(code);
+    if (code == 0x0B && response.information.size() >= 5) {
+        message += ": " + statusMessage(response.information[4]);
+    }
+    return {code == 0, code, std::move(message)};
 }
 
 std::optional<InitialData> parseInitialData(const hdlc::Frame& response) {

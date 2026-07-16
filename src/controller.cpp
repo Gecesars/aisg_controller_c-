@@ -22,6 +22,20 @@ std::string hex16(const std::uint16_t value) {
     return result;
 }
 
+std::optional<double> parseSignedDeciDegreeData(const hdlc::Frame& response) {
+    const auto data = aisg::parseData(response);
+    if (!data || !data->status.success || data->value.size() != 2) {
+        return std::nullopt;
+    }
+    const auto raw = static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(data->value[0]) |
+        (static_cast<std::uint16_t>(data->value[1]) << 8U));
+    const auto signedValue = raw < 0x8000U
+                                 ? static_cast<std::int32_t>(raw)
+                                 : static_cast<std::int32_t>(raw) - 0x10000;
+    return static_cast<double>(signedValue) / 10.0;
+}
+
 } // namespace
 
 struct ControllerService::Work {
@@ -60,6 +74,9 @@ OperationId ControllerService::connect(TransportConfig config) {
         {
             std::scoped_lock lock(stateMutex_);
             connected_ = true;
+            minimumFrameInterval_ =
+                std::max(config.minimumFrameInterval, std::chrono::milliseconds::zero());
+            lastFrameActivity_.reset();
         }
         emit({EventKind::connectionChanged, operation, std::chrono::system_clock::now(),
               std::nullopt, std::nullopt, -1, "Connected: " + transport_->description(), {}});
@@ -76,6 +93,8 @@ OperationId ControllerService::disconnect() {
             connected_ = false;
             devices_.clear();
             sequences_.clear();
+            minimumFrameInterval_ = std::chrono::milliseconds::zero();
+            lastFrameActivity_.reset();
         }
         emit({EventKind::devicesCleared, operation, std::chrono::system_clock::now(),
               std::nullopt, std::nullopt, -1, "Device list cleared", {}});
@@ -98,85 +117,300 @@ OperationId ControllerService::scan(const ScanOptions options) {
             scanAisg3(operation, options, cancelled);
             return;
         }
-
-        {
-            std::scoped_lock lock(stateMutex_);
-            devices_.clear();
-            sequences_.clear();
-        }
-        emit({EventKind::devicesCleared, operation, std::chrono::system_clock::now(),
-              std::nullopt, std::nullopt, 0, "Starting address scan", {}});
-
-        const auto total = static_cast<unsigned int>(options.lastAddress) -
-                           static_cast<unsigned int>(options.firstAddress) + 1U;
-        for (unsigned int rawAddress = options.firstAddress;
-             rawAddress <= options.lastAddress; ++rawAddress) {
-            if (cancelled->load()) {
-                return;
-            }
-            const auto address = static_cast<std::uint8_t>(rawAddress);
-            const auto snrm = aisg::makeSnrm(address);
-            const auto ua = transact(operation, snrm, options.responseTimeout, cancelled);
-            if (ua) {
-                Device found;
-                found.address = address;
-                found.status = DeviceStatus::initializing;
-
-                const auto initialRequest = aisg::makeInitialDataRequest(address, nextControl(address));
-                const auto initialResponse = transact(operation, initialRequest,
-                                                      options.responseTimeout, cancelled);
-                if (initialResponse) {
-                    if (const auto initial = aisg::parseInitialData(*initialResponse);
-                        initial && initial->status.success) {
-                        found.product = initial->product;
-                        found.serialNumber = initial->serialNumber;
-                        found.hardwareVersion = initial->hardwareVersion;
-                        found.softwareVersion = initial->softwareVersion;
-                        found.uid = initial->serialNumber;
-                    }
-                }
-
-                const auto isTma = found.product.find("TMA") != std::string::npos;
-                found.kind = isTma ? DeviceKind::tma : DeviceKind::ret;
-                if (isTma) {
-                    found.details = Tma{};
-                    auto& tma = std::get<Tma>(found.details);
-                    const auto gainRequest = aisg::makeGetTmaGainRequest(address, nextControl(address));
-                    if (const auto gainResponse = transact(operation, gainRequest,
-                                                           options.responseTimeout, cancelled)) {
-                        if (const auto gain = aisg::parseTmaGain(*gainResponse)) {
-                            tma.gainDb = *gain;
-                        }
-                    }
-                    const auto modeRequest = aisg::makeGetTmaModeRequest(address, nextControl(address));
-                    if (const auto modeResponse = transact(operation, modeRequest,
-                                                           options.responseTimeout, cancelled)) {
-                        if (const auto mode = aisg::parseTmaMode(*modeResponse)) {
-                            tma.mode = *mode;
-                        }
-                    }
-                } else {
-                    found.details = Ret{};
-                    const auto tiltRequest = aisg::makeGetTiltRequest(address, nextControl(address));
-                    const auto tiltResponse = transact(operation, tiltRequest,
-                                                       options.responseTimeout, cancelled);
-                    if (tiltResponse) {
-                        if (const auto tilt = aisg::parseTilt(*tiltResponse)) {
-                            std::get<Ret>(found.details).electricalTiltDegrees = *tilt;
-                        }
-                    }
-                }
-                found.status = DeviceStatus::ready;
-                storeDevice(std::move(found), operation, true);
-            }
-
-            const auto completed = rawAddress - options.firstAddress + 1U;
-            const auto progress = static_cast<int>((completed * 100U) / total);
-            emit({EventKind::scanProgress, operation, std::chrono::system_clock::now(),
-                  address, std::nullopt, progress,
-                  "Scanned AISG address " + std::to_string(rawAddress), {}});
-        }
+        scanAisg2(operation, options, cancelled);
     });
+}
+
+void ControllerService::scanAisg2(
+    const OperationId operation,
+    const ScanOptions& options,
+    const std::shared_ptr<std::atomic_bool>& cancelled) {
+    using namespace std::chrono_literals;
+
+    {
+        std::scoped_lock lock(stateMutex_);
+        devices_.clear();
+        sequences_.clear();
+    }
+    emit({EventKind::devicesCleared, operation, std::chrono::system_clock::now(),
+          std::nullopt, std::nullopt, 0,
+          options.discoverUnaddressed ? "Starting AISG 2.0 XID device scan"
+                                      : "Starting AISG 2.0 address scan", {}});
+
+    struct AssignedDevice {
+        std::uint8_t address{};
+        std::optional<aisg::XidIdentity> identity;
+    };
+    std::vector<AssignedDevice> assigned;
+
+    struct XidExchange {
+        bool activity{};
+        bool invalid{};
+        std::vector<hdlc::Frame> frames;
+    };
+    const auto exchangeXid = [&](const hdlc::Frame& request,
+                                 const std::chrono::milliseconds timeout) {
+        XidExchange result;
+        decoder_.reset();
+        const auto encoded = hdlc::encode(request);
+        if (!transmit(operation, encoded, cancelled)) return result;
+
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        bool rawActivity = false;
+        while (std::chrono::steady_clock::now() < deadline && !cancelled->load()) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            const auto received = transport_->read(std::min(std::max(remaining, 1ms), 25ms));
+            if (received.empty()) {
+                if (rawActivity) break;
+                continue;
+            }
+            noteFrameActivity();
+            rawActivity = true;
+            logFrame(EventKind::rxFrame, operation, received);
+            for (auto& decoded : decoder_.push(received)) {
+                if (!decoded.frame) {
+                    result.invalid = true;
+                    continue;
+                }
+                if (*decoded.frame == request) continue;
+                result.activity = true;
+                result.frames.push_back(std::move(*decoded.frame));
+            }
+        }
+        result.activity = result.activity || result.invalid || rawActivity;
+        decoder_.reset();
+        if (!result.frames.empty()) std::this_thread::sleep_for(3ms);
+        return result;
+    };
+
+    if (options.discoverUnaddressed) {
+        if (options.resetBeforeDiscovery) {
+            emit({EventKind::log, operation, std::chrono::system_clock::now(),
+                  std::nullopt, std::nullopt, -1,
+                  "Resetting virtual AISG 2.0 devices to NoAddress before discovery", {}});
+            // Reset Device in broadcast intentionally has no response. The
+            // configured quiet interval gives every simulated RET enough time
+            // to reinitialize before the first Device Scan.
+            (void)exchangeXid(aisg::makeResetDeviceRequest(),
+                              std::max(options.responseTimeout, 100ms));
+        }
+
+        enum class QueryKind { none, found, collision };
+        struct QueryResult {
+            QueryKind kind{QueryKind::none};
+            std::optional<aisg::XidIdentity> identity;
+        };
+        std::size_t queryCount{};
+        const auto query = [&](const hdlc::Bytes& value, const hdlc::Bytes& mask) {
+            if (++queryCount > 512) {
+                throw std::runtime_error(
+                    "AISG 2.0 XID collision resolution exceeded 512 queries");
+            }
+            const auto exchange = exchangeXid(
+                aisg::makeDeviceScanRequest(value, mask),
+                std::max(options.responseTimeout, 75ms));
+            std::vector<aisg::XidIdentity> identities;
+            for (const auto& frame : exchange.frames) {
+                if (auto parsed = aisg::parseDeviceScanResponse(frame)) {
+                    identities.push_back(std::move(*parsed));
+                }
+            }
+            // Em uma bancada virtual, respostas temporizadas de vários ALDs
+            // podem chegar como quadros íntegros. Qualquer identidade completa
+            // pode ser atribuída; a próxima varredura encontrará as restantes.
+            if (!exchange.invalid && !identities.empty()) {
+                return QueryResult{QueryKind::found, std::move(identities.front())};
+            }
+            return QueryResult{exchange.activity ? QueryKind::collision : QueryKind::none,
+                               std::nullopt};
+        };
+
+        using Pattern = std::array<std::uint8_t, 19>;
+        const auto scanPattern = [](const Pattern& value, const Pattern& mask) {
+            return std::pair{hdlc::Bytes(value.begin(), value.end()),
+                             hdlc::Bytes(mask.begin(), mask.end())};
+        };
+        std::function<std::optional<aisg::XidIdentity>(Pattern, Pattern, std::size_t)>
+            resolveCollision;
+        resolveCollision = [&](Pattern value, Pattern mask, const std::size_t firstBit)
+            -> std::optional<aisg::XidIdentity> {
+            for (std::size_t bit = firstBit; bit < value.size() * 8; ++bit) {
+                const auto octet = bit / 8;
+                const auto bitMask = static_cast<std::uint8_t>(1U << (7U - bit % 8U));
+                for (const bool one : {false, true}) {
+                    auto branchValue = value;
+                    auto branchMask = mask;
+                    branchMask[octet] |= bitMask;
+                    if (one) branchValue[octet] |= bitMask;
+                    else branchValue[octet] &= static_cast<std::uint8_t>(~bitMask);
+                    const auto [bytes, masks] = scanPattern(branchValue, branchMask);
+                    const auto branch = query(bytes, masks);
+                    if (branch.kind == QueryKind::found) return branch.identity;
+                    if (branch.kind == QueryKind::collision) {
+                        if (auto resolved = resolveCollision(
+                                branchValue, branchMask, bit + 1)) {
+                            return resolved;
+                        }
+                    }
+                }
+            }
+            return std::nullopt;
+        };
+
+        auto nextAddress = options.firstAddress;
+        while (!cancelled->load() && nextAddress <= options.lastAddress) {
+            queryCount = 0;
+            const auto broad = query({}, {});
+            if (broad.kind == QueryKind::none) break;
+            auto candidate = broad.identity;
+            if (broad.kind == QueryKind::collision) {
+                candidate = resolveCollision({}, {}, 0);
+            }
+            if (!candidate) {
+                throw std::runtime_error(
+                    "AISG 2.0 XID collision could not be resolved");
+            }
+
+            const hdlc::Bytes exactMask(candidate->uniqueId.size(), 0xFF);
+            const auto confirmation = query(candidate->uniqueId, exactMask);
+            if (confirmation.kind != QueryKind::found || !confirmation.identity ||
+                *confirmation.identity != *candidate) {
+                throw std::runtime_error("AISG 2.0 XID identity confirmation failed");
+            }
+            candidate = confirmation.identity;
+
+            const auto assignment = exchangeXid(
+                aisg::makeAddressAssignmentRequest(*candidate, nextAddress), 250ms);
+            std::size_t acknowledgements{};
+            for (const auto& frame : assignment.frames) {
+                if (aisg::isAddressAssignmentResponse(frame, *candidate, nextAddress)) {
+                    ++acknowledgements;
+                }
+            }
+            if (acknowledgements != 1) {
+                throw std::runtime_error(
+                    "AISG 2.0 address assignment was not uniquely acknowledged");
+            }
+            assigned.push_back({nextAddress, std::move(candidate)});
+            emit({EventKind::scanProgress, operation, std::chrono::system_clock::now(),
+                  nextAddress, std::nullopt,
+                  static_cast<int>((assigned.size() * 50U) /
+                                   (options.lastAddress - options.firstAddress + 1U)),
+                  "AISG 2.0 XID identity assigned", {}});
+            ++nextAddress;
+        }
+    } else {
+        for (unsigned int address = options.firstAddress;
+             address <= options.lastAddress; ++address) {
+            assigned.push_back({static_cast<std::uint8_t>(address), std::nullopt});
+        }
+    }
+
+    const auto responseTimeout = std::max(options.responseTimeout, 50ms);
+    for (std::size_t index = 0; index < assigned.size() && !cancelled->load(); ++index) {
+        const auto address = assigned[index].address;
+        const auto ua = transact(operation, aisg::makeSnrm(address),
+                                 responseTimeout, cancelled);
+        if (!ua || ua->control != 0x73) {
+            if (options.discoverUnaddressed) {
+                throw std::runtime_error("AISG 2.0 RET did not answer SNRM with UA");
+            }
+            continue;
+        }
+        std::this_thread::sleep_for(3ms);
+
+        if (options.discoverUnaddressed) {
+            bool accepted = false;
+            for (unsigned int attempt = 0; attempt < 2 && !accepted; ++attempt) {
+                const auto negotiation = exchangeXid(
+                    aisg::makeReleaseNegotiationRequest(address), responseTimeout);
+                accepted = std::ranges::any_of(
+                    negotiation.frames, [address](const auto& frame) {
+                        return aisg::isReleaseNegotiationResponse(frame, address);
+                    });
+                if (!accepted && attempt == 0 && !cancelled->load()) {
+                    emit({EventKind::log, operation, std::chrono::system_clock::now(),
+                          address, std::nullopt, -1,
+                          "AISG 2.0 release ACK not collected; retrying once", {}});
+                }
+            }
+            if (!accepted) {
+                throw std::runtime_error("AISG 2.0 release negotiation was not acknowledged");
+            }
+        }
+
+        Device found;
+        found.address = address;
+        found.status = DeviceStatus::initializing;
+        if (assigned[index].identity) {
+            const auto& identity = *assigned[index].identity;
+            found.uid.assign(identity.uniqueId.begin(), identity.uniqueId.end());
+            found.vendor.assign(identity.vendorCode.begin(), identity.vendorCode.end());
+        }
+
+        (void)transact(operation,
+                       aisg::makeSubscribeAlarmsRequest(address, nextControl(address)),
+                       responseTimeout, cancelled);
+        const auto initialResponse = transact(
+            operation, aisg::makeInitialDataRequest(address, nextControl(address)),
+            responseTimeout, cancelled);
+        if (initialResponse) {
+            if (const auto initial = aisg::parseInitialData(*initialResponse);
+                initial && initial->status.success) {
+                found.product = initial->product;
+                found.serialNumber = initial->serialNumber;
+                found.hardwareVersion = initial->hardwareVersion;
+                found.softwareVersion = initial->softwareVersion;
+                if (found.uid.empty()) found.uid = initial->serialNumber;
+            }
+        }
+
+        const auto isTma = found.product.find("TMA") != std::string::npos;
+        found.kind = isTma ? DeviceKind::tma : DeviceKind::ret;
+        if (isTma) {
+            found.details = Tma{};
+            auto& tma = std::get<Tma>(found.details);
+            if (const auto response = transact(
+                    operation, aisg::makeGetTmaGainRequest(address, nextControl(address)),
+                    responseTimeout, cancelled)) {
+                if (const auto gain = aisg::parseTmaGain(*response)) tma.gainDb = *gain;
+            }
+            if (const auto response = transact(
+                    operation, aisg::makeGetTmaModeRequest(address, nextControl(address)),
+                    responseTimeout, cancelled)) {
+                if (const auto mode = aisg::parseTmaMode(*response)) tma.mode = *mode;
+            }
+        } else {
+            found.details = Ret{};
+            auto& ret = std::get<Ret>(found.details);
+            if (const auto response = transact(
+                    operation, aisg::makeGetTiltRequest(address, nextControl(address)),
+                    responseTimeout, cancelled)) {
+                if (const auto tilt = aisg::parseTilt(*response)) {
+                    ret.electricalTiltDegrees = *tilt;
+                }
+            }
+            const auto readLimit = [&](const aisg::Field field) -> std::optional<double> {
+                const auto response = transact(
+                    operation, aisg::makeGetDataRequest(address, nextControl(address), field),
+                    responseTimeout, cancelled);
+                return response ? parseSignedDeciDegreeData(*response) : std::nullopt;
+            };
+            const auto maximum = readLimit(aisg::Field::maximumTilt);
+            const auto minimum = readLimit(aisg::Field::minimumTilt);
+            if (maximum && minimum && *minimum <= *maximum) {
+                ret.minimumTiltDegrees = *minimum;
+                ret.maximumTiltDegrees = *maximum;
+            }
+        }
+        found.status = DeviceStatus::ready;
+        storeDevice(std::move(found), operation, true);
+        emit({EventKind::scanProgress, operation, std::chrono::system_clock::now(),
+              address, std::nullopt,
+              static_cast<int>(((index + 1U) * 100U) / assigned.size()),
+              "AISG 2.0 RET discovered and initialized", {}});
+    }
 }
 
 void ControllerService::scanAisg3(
@@ -207,8 +441,7 @@ void ControllerService::scanAisg3(
         XidExchange result;
         decoder_.reset();
         const auto encoded = hdlc::encode(request);
-        logFrame(EventKind::txFrame, operation, encoded);
-        transport_->write(encoded);
+        if (!transmit(operation, encoded, cancelled)) return result;
 
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         bool rawActivity = false;
@@ -224,6 +457,7 @@ void ControllerService::scanAisg3(
                 }
                 continue;
             }
+            noteFrameActivity();
             rawActivity = true;
             logFrame(EventKind::rxFrame, operation, received);
             for (auto& decoded : decoder_.push(received)) {
@@ -615,8 +849,15 @@ OperationId ControllerService::moveRet(const std::uint8_t address, const double 
             throw std::invalid_argument("requested tilt is outside RET limits");
         }
 
+        const auto simulatedTravel = std::chrono::milliseconds(
+            static_cast<std::int64_t>(std::ceil(
+                std::abs(tiltDegrees - ret->electricalTiltDegrees) * 2000.0)));
         const auto request = aisg::makeSetTiltRequest(address, nextControl(address), tiltDegrees);
-        const auto response = transact(operation, request, std::chrono::milliseconds(1000), cancelled);
+        const auto response = transact(
+            operation, request,
+            std::max(std::chrono::milliseconds(3000),
+                     simulatedTravel + std::chrono::milliseconds(3000)),
+            cancelled);
         if (!response) {
             throw std::runtime_error("RET move timed out");
         }
@@ -973,6 +1214,30 @@ void ControllerService::logFrame(const EventKind kind,
           -1, hdlc::toHex(encoded), encoded});
 }
 
+bool ControllerService::transmit(
+    const OperationId operation,
+    const hdlc::Bytes& encoded,
+    const std::shared_ptr<std::atomic_bool>& cancelled) {
+    while (!cancelled->load() && lastFrameActivity_) {
+        const auto allowedAt = *lastFrameActivity_ + minimumFrameInterval_;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= allowedAt) break;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            allowedAt - now);
+        std::this_thread::sleep_for(std::min(remaining + std::chrono::milliseconds(1),
+                                             std::chrono::milliseconds(10)));
+    }
+    if (cancelled->load()) return false;
+    logFrame(EventKind::txFrame, operation, encoded);
+    transport_->write(encoded);
+    noteFrameActivity();
+    return true;
+}
+
+void ControllerService::noteFrameActivity() noexcept {
+    lastFrameActivity_ = std::chrono::steady_clock::now();
+}
+
 std::optional<hdlc::Frame> ControllerService::transact(
     const OperationId operation,
     const hdlc::Frame& request,
@@ -982,10 +1247,12 @@ std::optional<hdlc::Frame> ControllerService::transact(
         throw TransportError("transport is closed");
     }
     const auto encoded = hdlc::encode(request);
-    logFrame(EventKind::txFrame, operation, encoded);
-    transport_->write(encoded);
+    if (!transmit(operation, encoded, cancelled)) return std::nullopt;
 
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    // An accepted long-running Layer-7 command may first produce RR. Keep
+    // polling at the configured bus pace until its Layer-7 result is ready.
+    const auto deadline = std::chrono::steady_clock::now() + timeout +
+                          minimumFrameInterval_ + std::chrono::milliseconds(100);
     while (std::chrono::steady_clock::now() < deadline && !cancelled->load()) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now());
@@ -993,6 +1260,7 @@ std::optional<hdlc::Frame> ControllerService::transact(
         if (bytes.empty()) {
             continue;
         }
+        noteFrameActivity();
         logFrame(EventKind::rxFrame, operation, bytes);
         for (auto& result : decoder_.push(bytes)) {
             if (!result.frame) {
@@ -1002,6 +1270,30 @@ std::optional<hdlc::Frame> ControllerService::transact(
             }
             if (aisg::isResponseFor(*result.frame, request)) {
                 return std::move(*result.frame);
+            }
+            const auto& frame = *result.frame;
+            const bool receiveReady = frame.address == request.address &&
+                                      frame.information.empty() &&
+                                      (frame.control & 0x0FU) == 0x01U &&
+                                      (frame.control & 0x10U) != 0U;
+            const auto acknowledged = static_cast<std::uint8_t>(
+                ((((request.control >> 1U) & 7U) + 1U) & 7U));
+            if (receiveReady && ((frame.control >> 5U) & 7U) == acknowledged) {
+                // The RET accepted the primary I-frame but its asynchronous
+                // Layer-7 result is not ready yet. Poll with RR while keeping
+                // N(R) at the next secondary I-frame expected by the primary.
+                const auto nextPollAt =
+                    lastFrameActivity_.value_or(std::chrono::steady_clock::now()) +
+                    minimumFrameInterval_;
+                if (nextPollAt >= deadline) {
+                    continue;
+                }
+                const auto pollControl = static_cast<std::uint8_t>(
+                    (request.control & 0xE0U) | 0x11U);
+                const auto poll = hdlc::encode(
+                    aisg::makeKeepAlive(request.address, pollControl));
+                if (!transmit(operation, poll, cancelled)) return std::nullopt;
+                continue;
             }
             emit({EventKind::log, operation, std::chrono::system_clock::now(),
                   result.frame->address, std::nullopt, -1,
@@ -1022,8 +1314,7 @@ std::optional<aisg3::Response> ControllerService::transactAisg3(
     }
     const auto request = aisg3::makeCommandFrame(address, nextControl(address), command);
     const auto encoded = hdlc::encode(request);
-    logFrame(EventKind::txFrame, operation, encoded);
-    transport_->write(encoded);
+    if (!transmit(operation, encoded, cancelled)) return std::nullopt;
 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline && !cancelled->load()) {
@@ -1033,6 +1324,7 @@ std::optional<aisg3::Response> ControllerService::transactAisg3(
         if (received.empty()) {
             continue;
         }
+        noteFrameActivity();
         logFrame(EventKind::rxFrame, operation, received);
         for (auto& decoded : decoder_.push(received)) {
             if (!decoded.frame) {

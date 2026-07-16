@@ -69,7 +69,10 @@ public:
         controller_.reset();
         transport_.reset();
         simulatorTransport_.reset();
-        isSimulator_ = settings.simulator;
+        isSimulator_ = settings.profile == ConnectionProfile::SimulatorAisg2;
+        useAisg3_ = settings.profile == ConnectionProfile::SerialAisg3;
+        isVirtualAisg2_ = settings.profile == ConnectionProfile::SerialAisg2 &&
+                          settings.port == "/tmp/aisg_controlador";
         if (isSimulator_) {
             simulatorTransport_ = std::make_shared<atc::SimulatedTransport>();
             transport_ = simulatorTransport_;
@@ -87,10 +90,20 @@ public:
         // TIOCSRS485 can be enabled later for native UART endpoints.
         config.rs485 = false;
         config.readTimeout = 100ms;
+        // The AISG 2.0 bench profile intentionally leaves one full second of
+        // quiet bus time between frames, which also makes the HDLC exchange
+        // easy to inspect in the real-time monitor.
+        config.minimumFrameInterval = !isSimulator_ && !useAisg3_ ? 1s : 0ms;
         const auto result = wait(controller_->connect(std::move(config)), 2s);
-        if (result.ok) emit(isSimulator_ ? "CORE Simulador AISG 2 conectado"
-                                        : "CORE Serial AISG Base 3.0.8 conectado a 9600 8N1",
-                            false);
+        if (result.ok) {
+            if (isSimulator_) {
+                emit("CORE Simulador AISG 2 conectado", false);
+            } else if (useAisg3_) {
+                emit("CORE Serial AISG Base 3.0.8 conectado a 9600 8N1", false);
+            } else {
+                emit("CORE Serial AISG 2.0 conectado a 9600 8N1", false);
+            }
+        }
         return result;
     }
 
@@ -106,11 +119,15 @@ public:
         if (!connected()) return {};
         atc::ScanOptions options;
         options.firstAddress = 1;
-        options.lastAddress = isSimulator_ ? 4 : 254;
+        options.lastAddress = isSimulator_ ? 4 : isVirtualAisg2_ ? 2 : 254;
         options.responseTimeout = isSimulator_ ? 10ms : 250ms;
-        options.protocol = isSimulator_ ? atc::ProtocolProfile::legacyAisg2
-                                        : atc::ProtocolProfile::aisg3;
+        options.protocol = useAisg3_ ? atc::ProtocolProfile::aisg3
+                                     : atc::ProtocolProfile::legacyAisg2;
         options.primaryId = stablePrimaryId();
+        options.discoverUnaddressed = !isSimulator_ && !useAisg3_;
+        // Reset is intentionally restricted to the local two-PTY bench. A
+        // broadcast reset must never be inferred for arbitrary real hardware.
+        options.resetBeforeDiscovery = isVirtualAisg2_;
         const auto result = wait(controller_->scan(options), isSimulator_ ? 3s : 120s);
         if (!result.ok) return {};
 
@@ -118,7 +135,7 @@ public:
         const auto discovered = controller_->devices();
         for (const auto& device : discovered) {
             (void)wait(controller_->refreshAlarms(device.address),
-                       device.protocol == atc::ProtocolProfile::aisg3 ? 30s : 1s);
+                       device.protocol == atc::ProtocolProfile::aisg3 ? 30s : 4s);
         }
         return snapshot();
     }
@@ -131,14 +148,18 @@ public:
     }
 
     OperationResult refresh(DeviceRecord& device) override {
-        const auto result = wait(controller_->refresh(device.address), device.aisg3 ? 10s : 2s);
+        const auto result = wait(controller_->refresh(device.address), device.aisg3 ? 10s : 6s);
         update(device);
         return result;
     }
 
     OperationResult setTilt(DeviceRecord& device, const double targetDegrees) override {
         if (device.aisg3) return unsupportedAisg3Write();
-        const auto result = wait(controller_->moveRet(device.address, targetDegrees), 3s);
+        const auto simulatedTravel = std::chrono::milliseconds(
+            static_cast<std::int64_t>(std::ceil(
+                std::abs(targetDegrees - device.electricalTilt) * 2000.0)));
+        const auto result = wait(controller_->moveRet(device.address, targetDegrees),
+                                 simulatedTravel + 8s);
         update(device);
         return result;
     }
@@ -149,7 +170,7 @@ public:
         if (!std::isfinite(targetDb) || targetDb < 0.0 || targetDb > 31.75) {
             return {false, "Ganho fora do intervalo 0–31,75 dB"};
         }
-        const auto result = wait(controller_->setTmaGain(device.address, targetDb), 2s);
+        const auto result = wait(controller_->setTmaGain(device.address, targetDb), 4s);
         update(device);
         return result;
     }
@@ -158,27 +179,27 @@ public:
         if (device.aisg3) return unsupportedAisg3Write();
         if (device.kind != DeviceKind::Tma) return {false, "O dispositivo selecionado não é um TMA"};
         const auto result = wait(controller_->setTmaMode(
-            device.address, bypass ? atc::TmaMode::bypass : atc::TmaMode::normal), 2s);
+            device.address, bypass ? atc::TmaMode::bypass : atc::TmaMode::normal), 4s);
         update(device);
         return result;
     }
 
     OperationResult calibrate(DeviceRecord& device) override {
         if (device.aisg3) return unsupportedAisg3Write();
-        const auto result = wait(controller_->calibrate(device.address), 3s);
+        const auto result = wait(controller_->calibrate(device.address), 5s);
         update(device);
         return result;
     }
 
     OperationResult selfTest(DeviceRecord& device) override {
         if (device.aisg3) return unsupportedAisg3Write();
-        const auto result = wait(controller_->runSelfTest(device.address), 3s);
+        const auto result = wait(controller_->runSelfTest(device.address), 5s);
         update(device);
         return result;
     }
 
     OperationResult clearAlarms(DeviceRecord& device) override {
-        const auto result = wait(controller_->clearAlarms(device.address), device.aisg3 ? 15s : 2s);
+        const auto result = wait(controller_->clearAlarms(device.address), device.aisg3 ? 15s : 4s);
         update(device);
         return result;
     }
@@ -208,7 +229,7 @@ public:
             {atc::aisg::Field::sectorId, device.sector},
         };
         for (const auto& [field, value] : fields) {
-            const auto result = wait(controller_->setDeviceField(device.address, field, bytes(value)), 2s);
+            const auto result = wait(controller_->setDeviceField(device.address, field, bytes(value)), 4s);
             if (!result.ok) return result;
         }
         // Fields not represented by the experimental capture profile stay in
@@ -359,6 +380,8 @@ private:
     std::unique_ptr<atc::ControllerService> controller_;
     LogCallback log_;
     bool isSimulator_{true};
+    bool useAisg3_{};
+    bool isVirtualAisg2_{};
     std::atomic<atc::OperationId> currentOperation_{0};
 };
 

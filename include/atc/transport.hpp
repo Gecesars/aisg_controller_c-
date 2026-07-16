@@ -15,6 +15,9 @@ struct TransportConfig {
     unsigned int baudRate{115200};
     bool rs485{};
     std::chrono::milliseconds readTimeout{100};
+    // Minimum quiet time on the bus before the controller transmits another
+    // frame. Zero keeps the transport unpaced (used by unit tests/simulator).
+    std::chrono::milliseconds minimumFrameInterval{};
 };
 
 class TransportError : public std::runtime_error {

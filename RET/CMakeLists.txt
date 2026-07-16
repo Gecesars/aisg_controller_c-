@@ -3,6 +3,7 @@ project(ret_aisg2_firmware VERSION 2.0.0 LANGUAGES C)
 
 option(RET_BUILD_TESTS "Build protocol tests for the host" ON)
 option(RET_BUILD_STM32 "Build firmware for STM32F405RG" OFF)
+option(RET_BUILD_HOST "Build the POSIX bench RET executable" ON)
 
 add_library(ret_core STATIC
     src/ret_hdlc.c
@@ -13,6 +14,14 @@ target_compile_features(ret_core PUBLIC c_std_11)
 target_compile_options(ret_core PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 )
+
+if(RET_BUILD_HOST AND UNIX AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(ret_host platform/host/ret_host.c)
+    target_link_libraries(ret_host PRIVATE ret_core)
+    target_compile_options(ret_host PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+    )
+endif()
 
 if(RET_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     enable_testing()

@@ -44,8 +44,10 @@ struct DeviceRecord {
     int activeAlarms{0};
 };
 
+enum class ConnectionProfile { SimulatorAisg2 = 0, SerialAisg2 = 1, SerialAisg3 = 2 };
+
 struct ConnectionSettings {
-    bool simulator{true};
+    ConnectionProfile profile{ConnectionProfile::SimulatorAisg2};
     std::string port;
     int baudRate{9600};
 };

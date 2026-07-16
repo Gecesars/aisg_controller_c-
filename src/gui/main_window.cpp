@@ -247,8 +247,12 @@ QWidget* MainWindow::buildConnectionBar() {
 
     layout->addWidget(mutedLabel(QStringLiteral("TRANSPORTE")));
     transportCombo_ = new QComboBox;
-    transportCombo_->addItem(QStringLiteral("Simulador integrado"), true);
-    transportCombo_->addItem(QStringLiteral("Serial RS-485 • AISG 3.0.8"), false);
+    transportCombo_->addItem(QStringLiteral("Simulador integrado"),
+                             static_cast<int>(ConnectionProfile::SimulatorAisg2));
+    transportCombo_->addItem(QStringLiteral("Serial RS-485 • AISG 2.0"),
+                             static_cast<int>(ConnectionProfile::SerialAisg2));
+    transportCombo_->addItem(QStringLiteral("Serial RS-485 • AISG 3.0.8"),
+                             static_cast<int>(ConnectionProfile::SerialAisg3));
     transportCombo_->setMinimumWidth(210);
     layout->addWidget(transportCombo_);
 
@@ -292,13 +296,25 @@ QWidget* MainWindow::buildConnectionBar() {
         backend_->connected() ? disconnectBackend() : connectBackend();
     });
     connect(transportCombo_, &QComboBox::currentIndexChanged, this, [this] {
-        const bool simulator = transportCombo_->currentData().toBool();
-        portCombo_->setCurrentText(simulator ? QStringLiteral("virtual://aisg") : QStringLiteral("/dev/ttyUSB0"));
+        const auto profile = static_cast<ConnectionProfile>(transportCombo_->currentData().toInt());
+        const bool simulator = profile == ConnectionProfile::SimulatorAisg2;
+        if (simulator) {
+            portCombo_->setCurrentText(QStringLiteral("virtual://aisg"));
+        } else if (profile == ConnectionProfile::SerialAisg2) {
+            portCombo_->setCurrentText(QStringLiteral("/tmp/aisg_controlador"));
+        } else {
+            portCombo_->setCurrentText(QStringLiteral("/dev/ttyUSB0"));
+        }
         if (!simulator) baudCombo_->setCurrentText(QStringLiteral("9600"));
         baudCombo_->setEnabled(simulator && !backend_->connected());
         simulatorBanner_->setVisible(simulator);
-        appendLog(simulator ? QStringLiteral("Transporte selecionado: simulador integrado")
-                            : QStringLiteral("Serial AISG Base 3.0.8 / ADB 3.1.7 selecionado (9600 8N1)"));
+        if (simulator) {
+            appendLog(QStringLiteral("Transporte selecionado: simulador integrado"));
+        } else if (profile == ConnectionProfile::SerialAisg2) {
+            appendLog(QStringLiteral("Serial AISG 2.0 selecionado (9600 8N1)"));
+        } else {
+            appendLog(QStringLiteral("Serial AISG Base 3.0.8 / ADB 3.1.7 selecionado (9600 8N1)"));
+        }
     });
     return panel;
 }
@@ -663,7 +679,15 @@ void MainWindow::applyTheme() {
 void MainWindow::restoreSettings() {
     QSettings settings;
     restoreGeometry(settings.value(QStringLiteral("window/geometry")).toByteArray());
-    transportCombo_->setCurrentIndex(settings.value(QStringLiteral("connection/transport"), 0).toInt());
+    int savedProfile = static_cast<int>(ConnectionProfile::SimulatorAisg2);
+    if (settings.contains(QStringLiteral("connection/profile"))) {
+        savedProfile = settings.value(QStringLiteral("connection/profile")).toInt();
+    } else if (settings.value(QStringLiteral("connection/transport"), 0).toInt() == 1) {
+        // Migração da versão que só possuía Simulador e Serial AISG 3.
+        savedProfile = static_cast<int>(ConnectionProfile::SerialAisg3);
+    }
+    const int profileIndex = transportCombo_->findData(savedProfile);
+    transportCombo_->setCurrentIndex(profileIndex >= 0 ? profileIndex : 0);
     portCombo_->setCurrentText(settings.value(QStringLiteral("connection/port"), QStringLiteral("virtual://aisg")).toString());
     baudCombo_->setCurrentText(settings.value(QStringLiteral("connection/baud"), QStringLiteral("9600")).toString());
 }
@@ -671,21 +695,21 @@ void MainWindow::restoreSettings() {
 void MainWindow::saveSettings() {
     QSettings settings;
     settings.setValue(QStringLiteral("window/geometry"), saveGeometry());
-    settings.setValue(QStringLiteral("connection/transport"), transportCombo_->currentIndex());
+    settings.setValue(QStringLiteral("connection/profile"), transportCombo_->currentData());
     settings.setValue(QStringLiteral("connection/port"), portCombo_->currentText());
     settings.setValue(QStringLiteral("connection/baud"), baudCombo_->currentText());
 }
 
 void MainWindow::connectBackend() {
     if (backend_->connected()) return;
-    const bool simulator = transportCombo_->currentData().toBool();
-    if (!simulator) {
+    const auto profile = static_cast<ConnectionProfile>(transportCombo_->currentData().toInt());
+    if (profile == ConnectionProfile::SerialAisg3) {
         if (QMessageBox::warning(this, tr("Perfil serial AISG 3"),
             tr("O perfil serial implementa descoberta e atribuição XID AISG Base 3.0.8, negociação e leitura ADB 3.1.7. Comandos de movimento e configuração permanecem bloqueados.\n\nValide o adaptador RS-485 com controle automático de direção antes do uso. Deseja abrir a porta selecionada?"),
             QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Ok) return;
     }
     ConnectionSettings settings{
-        .simulator = simulator,
+        .profile = profile,
         .port = portCombo_->currentText().toStdString(),
         .baudRate = baudCombo_->currentText().toInt(),
     };
@@ -777,7 +801,8 @@ void MainWindow::setConnectionState(bool connected) {
                                               : QStringLiteral("color: #94a3b8; font-weight: 700;"));
     transportCombo_->setEnabled(!connected);
     portCombo_->setEnabled(!connected);
-    baudCombo_->setEnabled(!connected && transportCombo_->currentData().toBool());
+    const auto profile = static_cast<ConnectionProfile>(transportCombo_->currentData().toInt());
+    baudCombo_->setEnabled(!connected && profile == ConnectionProfile::SimulatorAisg2);
     connectAction_->setEnabled(!connected);
     disconnectAction_->setEnabled(connected);
     scanAction_->setEnabled(connected);

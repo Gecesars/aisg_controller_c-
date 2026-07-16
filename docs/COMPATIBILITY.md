@@ -2,7 +2,7 @@
 
 ## Escopo da revisão
 
-O perfil serial foi revisado contra os documentos locais:
+O perfil serial AISG 3 foi revisado contra os documentos locais:
 
 - **AISG Base Standard v3.0.8.2**, de 14 de outubro de 2024;
 - **AISG-ST-ADB vADB3.1.7.6**, de 27 de junho de 2024.
@@ -50,7 +50,7 @@ Ela não declara certificação AISG do produto inteiro.
 
 ## Perfil operacional habilitado
 
-No modo serial, a aplicação:
+No perfil serial **AISG 3.0.8**, a aplicação:
 
 1. abre a porta em `9600 8N1`;
 2. calcula um PrimaryID estável a partir do `/etc/machine-id` usado como nome

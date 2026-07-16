@@ -11,6 +11,18 @@
 
 namespace atc::aisg {
 
+inline constexpr std::uint8_t allStationsAddress = 0xFF;
+inline constexpr std::uint8_t noStationAddress = 0x00;
+inline constexpr std::uint8_t xidControl = 0xBF;
+
+struct XidIdentity {
+    hdlc::Bytes uniqueId;
+    std::uint8_t deviceType{};
+    std::array<char, 2> vendorCode{};
+
+    friend bool operator==(const XidIdentity&, const XidIdentity&) = default;
+};
+
 // These endpoint identifiers are inferred from captured AISG 2.0 traffic.
 // They remain experimental until checked against licensed specifications and
 // real hardware from each vendor.
@@ -62,6 +74,22 @@ private:
 [[nodiscard]] std::uint8_t expectedResponseControl(std::uint8_t requestControl) noexcept;
 [[nodiscard]] bool isResponseFor(const hdlc::Frame& response, const hdlc::Frame& request) noexcept;
 
+[[nodiscard]] hdlc::Frame makeDeviceScanRequest(
+    std::span<const std::uint8_t> uniqueId = {},
+    std::span<const std::uint8_t> uniqueIdMask = {});
+[[nodiscard]] std::optional<XidIdentity> parseDeviceScanResponse(const hdlc::Frame& frame);
+[[nodiscard]] hdlc::Frame makeAddressAssignmentRequest(const XidIdentity& identity,
+                                                       std::uint8_t address);
+[[nodiscard]] bool isAddressAssignmentResponse(const hdlc::Frame& frame,
+                                               const XidIdentity& identity,
+                                               std::uint8_t address);
+[[nodiscard]] hdlc::Frame makeReleaseNegotiationRequest(std::uint8_t address,
+                                                        std::uint8_t release = 14);
+[[nodiscard]] bool isReleaseNegotiationResponse(const hdlc::Frame& frame,
+                                                std::uint8_t address);
+[[nodiscard]] hdlc::Frame makeResetDeviceRequest(
+    std::uint8_t address = allStationsAddress);
+
 [[nodiscard]] hdlc::Frame makeSnrm(std::uint8_t address);
 [[nodiscard]] hdlc::Frame makeKeepAlive(std::uint8_t address, std::uint8_t control);
 [[nodiscard]] hdlc::Frame makeInitialDataRequest(std::uint8_t address, std::uint8_t control);
@@ -69,6 +97,8 @@ private:
 [[nodiscard]] hdlc::Frame makeSetTiltRequest(std::uint8_t address, std::uint8_t control, double degrees);
 [[nodiscard]] hdlc::Frame makeGetAlarmsRequest(std::uint8_t address, std::uint8_t control);
 [[nodiscard]] hdlc::Frame makeClearAlarmsRequest(std::uint8_t address, std::uint8_t control);
+[[nodiscard]] hdlc::Frame makeSubscribeAlarmsRequest(std::uint8_t address,
+                                                     std::uint8_t control);
 [[nodiscard]] hdlc::Frame makeSelfTestRequest(std::uint8_t address, std::uint8_t control);
 [[nodiscard]] hdlc::Frame makeCalibrateRequest(std::uint8_t address, std::uint8_t control);
 [[nodiscard]] hdlc::Frame makeSetTmaModeRequest(std::uint8_t address,

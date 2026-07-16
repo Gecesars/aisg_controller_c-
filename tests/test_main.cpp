@@ -243,6 +243,114 @@ private:
     std::deque<atc::hdlc::Bytes> responses_;
 };
 
+class AsyncLegacyTestTransport final : public atc::ITransport {
+public:
+    void open(const atc::TransportConfig&) override {
+        open_ = true;
+        responses_.clear();
+        pending_.reset();
+        pendingRr_.reset();
+        remainingRrPolls_ = 0;
+        controls_.clear();
+        writeTimes_.clear();
+    }
+
+    void close() noexcept override {
+        open_ = false;
+        responses_.clear();
+    }
+
+    [[nodiscard]] bool isOpen() const noexcept override { return open_; }
+
+    void write(const std::span<const std::uint8_t> encoded) override {
+        if (!open_) throw atc::TransportError("async legacy test transport is closed");
+        const auto decoded = atc::hdlc::decode(encoded);
+        if (!decoded) throw atc::TransportError("invalid frame in async legacy test");
+        const auto& request = *decoded.frame;
+        controls_.push_back(request.control);
+        writeTimes_.push_back(std::chrono::steady_clock::now());
+
+        if (request.control == 0x93) {
+            queue({request.address, 0x73, {}});
+            return;
+        }
+        if (request.information.empty()) {
+            if (pending_ && (request.control & 0x0F) == 0x01) {
+                if (remainingRrPolls_ > 0 && pendingRr_) {
+                    queue(*pendingRr_);
+                    --remainingRrPolls_;
+                } else {
+                    queue(*pending_);
+                    pending_.reset();
+                    pendingRr_.reset();
+                }
+            }
+            return;
+        }
+
+        const auto command = request.information.front();
+        if (command == static_cast<std::uint8_t>(atc::aisg::Command::calibrate)) {
+            const auto acknowledged = static_cast<std::uint8_t>(
+                ((((request.control >> 1U) & 7U) + 1U) & 7U));
+            pendingRr_ = atc::hdlc::Frame{
+                request.address,
+                static_cast<std::uint8_t>((acknowledged << 5U) | 0x11U), {}};
+            queue(*pendingRr_);
+            remainingRrPolls_ = 2;
+            pending_ = atc::hdlc::Frame{
+                request.address,
+                atc::aisg::expectedResponseControl(request.control),
+                {command, 0x01, 0x00, 0x00}};
+            return;
+        }
+
+        atc::hdlc::Bytes information{command, 0x01, 0x00, 0x00};
+        if (command == static_cast<std::uint8_t>(atc::aisg::Command::getTilt)) {
+            information = {command, 0x03, 0x00, 0x00, 0x14, 0x00};
+        }
+        queue({request.address, atc::aisg::expectedResponseControl(request.control),
+               std::move(information)});
+    }
+
+    [[nodiscard]] atc::hdlc::Bytes read(const std::chrono::milliseconds timeout,
+                                        const std::size_t maximumBytes = 4096) override {
+        if (responses_.empty()) {
+            std::this_thread::sleep_for(std::min(timeout, 1ms));
+            return {};
+        }
+        auto result = std::move(responses_.front());
+        responses_.pop_front();
+        if (result.size() > maximumBytes) result.resize(maximumBytes);
+        return result;
+    }
+
+    [[nodiscard]] std::string description() const override {
+        return "AISG 2.0 asynchronous RR test";
+    }
+
+    [[nodiscard]] const std::vector<std::uint8_t>& controls() const noexcept {
+        return controls_;
+    }
+
+    [[nodiscard]] const std::vector<std::chrono::steady_clock::time_point>&
+    writeTimes() const noexcept {
+        return writeTimes_;
+    }
+
+private:
+    void queue(const atc::hdlc::Frame& frame) {
+        responses_.push_back(atc::hdlc::encode(frame));
+    }
+
+    bool open_{};
+    std::deque<atc::hdlc::Bytes> responses_;
+    std::optional<atc::hdlc::Frame> pending_;
+    std::optional<atc::hdlc::Frame> pendingRr_;
+    unsigned int remainingRrPolls_{};
+    std::vector<std::uint8_t> controls_;
+    std::vector<std::chrono::steady_clock::time_point> writeTimes_;
+};
+
 void testCrcAndCapturedFrames() {
     const std::string standard = "123456789";
     require(atc::hdlc::crc16X25(std::span(
@@ -267,11 +375,22 @@ void testCrcAndCapturedFrames() {
     const auto tilt = atc::aisg::parseTilt(*tiltResponse.frame);
     require(tilt && *tilt == 12.0, "captured tilt value was not parsed as 12.0 degrees");
 
+    const auto setTilt = atc::aisg::makeSetTiltRequest(1, 0xBA, 15.0);
+    require(setTilt.information == bytes({0x33, 0x02, 0x00, 0x96, 0x00}),
+            "sRET Set Tilt did not declare exactly two target-tilt octets");
+
     const atc::hdlc::Frame rejectedMove{
         1, 0x30, {static_cast<std::uint8_t>(atc::aisg::Command::setTilt), 0x01, 0x00, 0x03}};
     const auto rejectedStatus = atc::aisg::parseStatus(rejectedMove, atc::aisg::Command::setTilt);
     require(!rejectedStatus.success && rejectedStatus.code == 0x03,
             "AISG return code was not read after the two-byte data length");
+    const atc::hdlc::Frame formatError{
+        1, 0xDA, {static_cast<std::uint8_t>(atc::aisg::Command::setTilt),
+                   0x02, 0x00, 0x0B, 0x24}};
+    const auto nestedStatus = atc::aisg::parseStatus(formatError, atc::aisg::Command::setTilt);
+    require(!nestedStatus.success && nestedStatus.code == 0x0B &&
+                nestedStatus.message == "operation failed: format error",
+            "AISG general failure did not expose its nested reason code");
 
     const auto initial = atc::hdlc::decode(bytes({
         0x7E, 0x01, 0x52, 0x05, 0x34, 0x00, 0x00, 0x0C, 0x52, 0x43, 0x55,
@@ -307,6 +426,51 @@ void testStuffingAndStreaming() {
     const auto invalid = atc::hdlc::decode(corrupted);
     require(!invalid && invalid.error == atc::hdlc::DecodeError::checksumMismatch,
             "corrupt frame was not rejected by CRC");
+}
+
+void testAisg2XidDiscovery() {
+    const auto broad = atc::aisg::makeDeviceScanRequest();
+    require(broad.address == 0xFF && broad.control == 0xBF &&
+                broad.information == bytes({0x81, 0xF0, 0x04,
+                                             0x01, 0x00, 0x03, 0x00}),
+            "AISG 2.0 broad Device Scan payload is invalid");
+
+    const auto capturedScan = atc::hdlc::decode(bytes({
+        0x7E, 0x00, 0xBF, 0x81, 0xF0, 0x1C, 0x01, 0x13, 0x54, 0x59, 0x30,
+        0x38, 0x30, 0x39, 0x52, 0x31, 0x2D, 0x48, 0x32, 0x33, 0x31, 0x32,
+        0x33, 0x34, 0x35, 0x36, 0x31, 0x06, 0x02, 0x54, 0x59, 0x04, 0x01,
+        0x01, 0xBB, 0xD4, 0x7E}));
+    require(static_cast<bool>(capturedScan),
+            "captured AISG 2.0 Device Scan response failed HDLC");
+    const auto identity = atc::aisg::parseDeviceScanResponse(*capturedScan.frame);
+    require(identity && identity->vendorCode == std::array<char, 2>{'T', 'Y'} &&
+                identity->deviceType == 1 && identity->uniqueId.size() == 19,
+            "captured AISG 2.0 identity response was not parsed");
+
+    const auto assignment = atc::aisg::makeAddressAssignmentRequest(*identity, 1);
+    require(atc::hdlc::encode(assignment) == bytes({
+                0x7E, 0xFF, 0xBF, 0x81, 0xF0, 0x18, 0x01, 0x13, 0x54, 0x59,
+                0x30, 0x38, 0x30, 0x39, 0x52, 0x31, 0x2D, 0x48, 0x32, 0x33,
+                0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x31, 0x02, 0x01, 0x01,
+                0xB8, 0x85, 0x7E}),
+            "AISG 2.0 address assignment differs from dois rets.txt");
+
+    const auto capturedAck = atc::hdlc::decode(bytes({
+        0x7E, 0x01, 0xBF, 0x81, 0xF0, 0x18, 0x01, 0x13, 0x54, 0x59, 0x30,
+        0x38, 0x30, 0x39, 0x52, 0x31, 0x2D, 0x48, 0x32, 0x33, 0x31, 0x32,
+        0x33, 0x34, 0x35, 0x36, 0x31, 0x04, 0x01, 0x01, 0xBA, 0x40, 0x7E}));
+    require(capturedAck && atc::aisg::isAddressAssignmentResponse(
+                               *capturedAck.frame, *identity, 1),
+            "AISG 2.0 address-assignment acknowledgement was rejected");
+
+    require(atc::aisg::makeReleaseNegotiationRequest(1).information ==
+                bytes({0x81, 0xF0, 0x03, 0x05, 0x01, 0x0E}),
+            "AISG 2.0 release negotiation payload is invalid");
+    const auto reset = atc::aisg::makeResetDeviceRequest();
+    require(reset.address == atc::aisg::allStationsAddress &&
+                reset.control == atc::aisg::xidControl &&
+                reset.information == bytes({0x81, 0xF0, 0x02, 0x07, 0x00}),
+            "AISG 2.0 broadcast Reset Device payload is invalid");
 }
 
 void testAisg3XidConformance() {
@@ -627,6 +791,41 @@ void testControllerEndToEnd() {
             "disconnect did not clear controller state");
 }
 
+void testAisg2PacingAndAsynchronousPoll() {
+    auto transport = std::make_shared<AsyncLegacyTestTransport>();
+    atc::ControllerService controller(transport);
+
+    atc::TransportConfig config;
+    config.endpoint = "test://aisg2-async";
+    config.baudRate = 9600;
+    config.minimumFrameInterval = 20ms;
+    waitFor(controller, controller.connect(config));
+
+    atc::ScanOptions options;
+    options.firstAddress = 1;
+    options.lastAddress = 1;
+    options.responseTimeout = 10ms;
+    waitFor(controller, controller.scan(options));
+    require(controller.devices().size() == 1,
+            "async AISG 2.0 fixture was not discovered");
+
+    waitFor(controller, controller.calibrate(1));
+    const auto& controls = transport->controls();
+    require(controls.size() >= 10 && controls[controls.size() - 4] == 0xBA &&
+                controls[controls.size() - 3] == 0xB1 &&
+                controls[controls.size() - 2] == 0xB1 &&
+                controls.back() == 0xB1,
+            "controller did not maintain supervisory polling until completion");
+
+    const auto& times = transport->writeTimes();
+    require(times.size() == controls.size(), "paced transport timestamp count mismatch");
+    for (std::size_t index = 1; index < times.size(); ++index) {
+        require(times[index] - times[index - 1] >= 19ms,
+                "controller transmitted before the configured quiet interval");
+    }
+    waitFor(controller, controller.disconnect());
+}
+
 void testControllerAisg3AdbEndToEnd() {
     auto transport = std::make_shared<Aisg3AdbTestTransport>();
     atc::ControllerService controller(transport);
@@ -696,6 +895,7 @@ int main() {
     const std::vector<std::pair<std::string, std::function<void()>>> tests{
         {"CRC and captured frames", testCrcAndCapturedFrames},
         {"stuffing and streaming", testStuffingAndStreaming},
+        {"AISG 2.0 XID discovery", testAisg2XidDiscovery},
         {"AISG v3 XID conformance", testAisg3XidConformance},
         {"AISG v3 Layer 7 conformance", testAisg3Layer7Conformance},
         {"ADB 3.1.7 conformance", testAdb317Conformance},
@@ -704,6 +904,7 @@ int main() {
         {"simulator low-level", testSimulatorLowLevel},
         {"POSIX serial safe failure", testPosixSerialFailureIsSafe},
         {"controller end-to-end", testControllerEndToEnd},
+        {"AISG 2.0 pacing and asynchronous poll", testAisg2PacingAndAsynchronousPoll},
         {"AISG v3 ADB controller end-to-end", testControllerAisg3AdbEndToEnd},
         {"controller cancellation", testControllerCancellation},
     };

@@ -179,12 +179,13 @@ void SimulatedTransport::process(const hdlc::Frame& request) {
     }
     case aisg::Command::setTilt: {
         auto* ret = simulated.device.ret();
-        if (!ret || request.information.size() < 6) {
+        if (!ret || request.information.size() != 5 ||
+            request.information[1] != 0x02 || request.information[2] != 0x00) {
             information = {static_cast<std::uint8_t>(command), 0x01, 0x00, 0x03};
             break;
         }
-        const auto deciDegrees = static_cast<std::uint16_t>(request.information[4]) |
-                                 (static_cast<std::uint16_t>(request.information[5]) << 8U);
+        const auto deciDegrees = static_cast<std::uint16_t>(request.information[3]) |
+                                 (static_cast<std::uint16_t>(request.information[4]) << 8U);
         const auto degrees = static_cast<double>(deciDegrees) / 10.0;
         if (!ret->acceptsTilt(degrees)) {
             information = {static_cast<std::uint8_t>(command), 0x01, 0x00, 0x03};
